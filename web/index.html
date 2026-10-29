@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>File Share</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #f4f5f7;
+    color: #1b1f24;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.lede { margin: 0 0 24px; color: #5b6572; font-size: 14px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  input[type="password"], input[type="file"] {
+    width: 100%; box-sizing: border-box; padding: 9px 11px;
+    border: 1px solid #c9cfd8; border-radius: 8px; background: #fff; color: inherit;
+    font: inherit;
+  }
+  button {
+    font: inherit; font-weight: 600; padding: 9px 16px; border-radius: 8px;
+    border: 1px solid #1f6feb; background: #1f6feb; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: progress; }
+  .row { display: flex; gap: 10px; margin-top: 18px; align-items: stretch; flex-wrap: wrap; }
+  .row input[type="file"] { flex: 1 1 260px; width: auto; }
+  #status { min-height: 22px; margin: 14px 0 0; font-size: 14px; color: #5b6572; }
+  #status.error { color: #c0392b; }
+  h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .06em; color: #5b6572; margin: 32px 0 10px; }
+  ul { list-style: none; margin: 0; padding: 0; border: 1px solid #dde2e9; border-radius: 10px; background: #fff; overflow: hidden; }
+  li { display: flex; gap: 12px; align-items: center; padding: 11px 14px; border-top: 1px solid #eef1f5; }
+  li:first-child { border-top: 0; }
+  li.empty { color: #8a94a1; justify-content: center; }
+  .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; }
+  .meta { flex: 0 0 auto; font-size: 12px; color: #7a8492; }
+  li button { padding: 5px 11px; font-size: 13px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #14171c; color: #e6e9ee; }
+    input[type="password"], input[type="file"], ul { background: #1b1f26; border-color: #2c333d; }
+    li { border-color: #232a33; }
+    #status, p.lede, h2, .meta { color: #97a2b1; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>File Share</h1>
+  <p class="lede">Files upload straight from this browser to the bucket. The API only signs links.</p>
+
+  <label for="api-key">API key</label>
+  <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="X-API-Key">
+
+  <div class="row">
+    <input id="file" type="file" aria-label="Choose a file">
+    <button id="upload" type="button">Upload</button>
+  </div>
+
+  <p id="status" role="status" aria-live="polite"></p>
+
+  <h2>Files</h2>
+  <ul id="files"><li class="empty">Enter your API key to list files.</li></ul>
+</main>
+<script>
+  // Address of the Go API. Change this when the API is deployed somewhere else.
+  const API_URL = "http://localhost:8080";
+  const MAX_BYTES = 50 * 1024 * 1024;
+
+  const keyInput = document.getElementById("api-key");
+  const fileInput = document.getElementById("file");
+  const uploadButton = document.getElementById("upload");
+  const statusEl = document.getElementById("status");
+  const filesEl = document.getElementById("files");
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = kind || "";
+  }
+
+  function requireKey() {
+    const key = keyInput.value.trim();
+    if (!key) throw new Error("Enter the API key first.");
+    return key;
+  }
+
+  async function api(pathAndQuery, options) {
+    const settings = options || {};
+    const headers = Object.assign({ "X-API-Key": requireKey() }, settings.headers || {});
+    const res = await fetch(API_URL + pathAndQuery, Object.assign({}, settings, { headers }));
+    let body = null;
+    try {
+      body = await res.json();
+    } catch (_) {
+      // A non-JSON body is reported through the status code below.
+    }
+    if (!res.ok) {
+      throw new Error((body && body.error) || "Request failed with HTTP " + res.status);
+    }
+    return body;
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    const units = ["KB", "MB", "GB", "TB"];
+    let value = bytes;
+    let unit = -1;
+    do {
+      value /= 1024;
+      unit += 1;
+    } while (value >= 1024 && unit < units.length - 1);
+    return (value < 10 ? value.toFixed(1) : Math.round(value)) + " " + units[unit];
+  }
+
+  function renderFiles(files) {
+    filesEl.replaceChildren();
+    if (!files || files.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "empty";
+      empty.textContent = "No files yet.";
+      filesEl.append(empty);
+      return;
+    }
+    for (const file of files) {
+      const item = document.createElement("li");
+
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = file.key;
+      name.title = file.key;
+
+      const meta = document.createElement("span");
+      meta.className = "meta";
+      const when = file.lastModified ? new Date(file.lastModified).toLocaleString() : "";
+      meta.textContent = formatBytes(file.size) + (when ? " · " + when : "");
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = "Download";
+      button.addEventListener("click", function () {
+        download(file.key, button);
+      });
+
+      item.append(name, meta, button);
+      filesEl.append(item);
+    }
+  }
+
+  async function loadFiles() {
+    const files = await api("/files");
+    renderFiles(files);
+  }
+
+  async function download(key, button) {
+    button.disabled = true;
+    setStatus("Signing a link for " + key + "…");
+    try {
+      const signed = await api("/download-url?key=" + encodeURIComponent(key));
+      setStatus("Download started.");
+      window.location.href = signed.url;
+    } catch (err) {
+      setStatus(err.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function upload() {
+    const file = fileInput.files[0];
+    if (!file) {
+      setStatus("Choose a file first.", "error");
+      return;
+    }
+    if (file.size > MAX_BYTES) {
+      setStatus("Files must be 50 MB or smaller.", "error");
+      return;
+    }
+
+    uploadButton.disabled = true;
+    try {
+      setStatus("Requesting an upload link…");
+      const signed = await api("/upload-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name, size: file.size })
+      });
+
+      setStatus("Uploading " + file.name + "…");
+      const put = await fetch(signed.url, {
+        method: "PUT",
+        body: file,
+        headers: { "Content-Type": file.type || "application/octet-stream" }
+      });
+      if (!put.ok) {
+        throw new Error("Upload failed with HTTP " + put.status);
+      }
+
+      fileInput.value = "";
+      setStatus("Upload complete.");
+      await loadFiles();
+    } catch (err) {
+      setStatus(err.message, "error");
+    } finally {
+      uploadButton.disabled = false;
+    }
+  }
+
+  uploadButton.addEventListener("click", upload);
+
+  keyInput.addEventListener("change", function () {
+    if (!keyInput.value.trim()) return;
+    loadFiles().catch(function (err) {
+      setStatus(err.message, "error");
+    });
+  });
+</script>
+</body>
+</html>
