@@ -117,7 +117,7 @@ origin in `ALLOWED_ORIGIN`. The bucket also needs a CORS rule allowing `PUT`
 and `GET` from that origin, because the upload and download requests go straight
 to B2 and not through the API.
 
-## Not verified
+## Checks run, and what was not
 
 Checks that were run, on Go 1.27.3: `CGO_ENABLED=0 GOOS=linux go build -o
 server ./api` succeeds and produces a statically linked linux/amd64 binary,
