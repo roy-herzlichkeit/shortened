@@ -9,7 +9,7 @@ bucket that holds the bytes, and one HTML page that talks to both.
 | --- | --- |
 | [api/main.go](api/main.go) | The whole API: config loading, B2 client, four handlers, CORS/API-key middleware. |
 | [web/index.html](web/index.html) | The whole UI: API key field, file picker, Upload button, file list with Download links. Plain HTML + JS, no build step. |
-| [Dockerfile](Dockerfile) | Multi-stage build (`golang:1.23-alpine` → `alpine:3.20`), `CGO_ENABLED=0`, binary only in the final image. |
+| [Dockerfile](Dockerfile) | Multi-stage build (`golang:1.27-alpine` → `alpine:3.20`), `CGO_ENABLED=0`, binary only in the final image. |
 | [.env.example](.env.example) | Every environment variable with fake values. |
 | [go.mod](go.mod) | Module `github.com/roy-herzlichkeit/shortened`, Go 1.24, with the four AWS SDK modules pinned. Only the SDK plus the standard library is used. |
 
@@ -121,8 +121,11 @@ to B2 and not through the API.
 ## Not verified
 
 The code was not compiled and not run: there is no Go toolchain on the machine
-that wrote it and Docker's daemon was unavailable, so `go build`, `go vet` and
-`gofmt` were never executed. Nothing was executed against a real bucket either:
-no upload, download, listing, signed link or browser session was exercised.
-Treat the code as unbuilt and untested; B2 CORS rules, key permissions and any
-B2-specific SDK behaviour are unconfirmed until you try them.
+that wrote it and Docker's daemon was unavailable, so `go build` and `go vet`
+were never executed. The only checks done were mechanical: `gofmt` (through the
+Go playground formatter) returned the file unchanged, the SDK identifiers used
+here were read back from the published API docs, and the page's script block
+parses with `node --check`. Nothing was exercised against a real bucket: no
+upload, download, listing, signed link or browser session was tried. Treat the
+code as unbuilt and untested; B2 CORS rules, key permissions and any B2-specific
+SDK behaviour are unconfirmed until you try them.
