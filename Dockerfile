@@ -5,14 +5,10 @@
 FROM golang:1.27-alpine AS build
 WORKDIR /src
 
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY api/ ./api/
-
-# go.sum is not committed yet, because the module graph has never been resolved
-# on a machine with a Go toolchain. tidy resolves and pins it in this layer, so
-# the build is self-contained.
-RUN go mod tidy
-
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server ./api
 
 # Final stage: no Go toolchain and no package tooling, just the binary and the

@@ -11,7 +11,7 @@ bucket that holds the bytes, and one HTML page that talks to both.
 | [web/index.html](web/index.html) | The whole UI: API key field, file picker, Upload button, file list with Download links. Plain HTML + JS, no build step. |
 | [Dockerfile](Dockerfile) | Multi-stage build (`golang:1.27-alpine` → `alpine:3.20`), `CGO_ENABLED=0`, binary only in the final image. |
 | [.env.example](.env.example) | Every environment variable with fake values. |
-| [go.mod](go.mod) | Module `github.com/roy-herzlichkeit/shortened`, Go 1.24, with the four AWS SDK modules pinned. Only the SDK plus the standard library is used. |
+| [go.mod](go.mod) / [go.sum](go.sum) | Module `github.com/roy-herzlichkeit/shortened`, Go 1.24, with the four AWS SDK modules and their transitive versions pinned and hashed. Only the SDK plus the standard library is used. |
 
 ## Request flow
 
@@ -104,12 +104,11 @@ docker build -t shortened-api .
 docker run --rm -p 8080:8080 --env-file .env shortened-api
 ```
 
-or directly: `go mod tidy` once, then `CGO_ENABLED=0 GOOS=linux go build -o server ./api && ./server`.
+or directly with the contract's build command:
 
-`go.sum` is not in the repo: the module graph was never resolved on a machine
-with a Go toolchain, so it could not be generated. The Dockerfile runs
-`go mod tidy` in the build stage to create it, and a local build needs that same
-one-liner before `go build`.
+```
+CGO_ENABLED=0 GOOS=linux go build -o server ./api
+```
 
 The page is static, so it is served separately — `python -m http.server` in
 `web/` is enough for local use. Two things must line up with it: set `API_URL`
@@ -120,12 +119,20 @@ to B2 and not through the API.
 
 ## Not verified
 
-The code was not compiled and not run: there is no Go toolchain on the machine
-that wrote it and Docker's daemon was unavailable, so `go build` and `go vet`
-were never executed. The only checks done were mechanical: `gofmt` (through the
-Go playground formatter) returned the file unchanged, the SDK identifiers used
-here were read back from the published API docs, and the page's script block
-parses with `node --check`. Nothing was exercised against a real bucket: no
-upload, download, listing, signed link or browser session was tried. Treat the
-code as unbuilt and untested; B2 CORS rules, key permissions and any B2-specific
-SDK behaviour are unconfirmed until you try them.
+Checks that were run, on Go 1.27.3: `CGO_ENABLED=0 GOOS=linux go build -o
+server ./api` succeeds and produces a statically linked linux/amd64 binary,
+`go vet ./api` is clean, `gofmt -l api` reports nothing, and the page's script
+passes `node --check`. A local windows build was also started against fake B2
+credentials to drive the HTTP layer: `/health` returns `200
+{"status":"ok"}`; a missing and a wrong `X-API-Key` both return `401`; an
+`OPTIONS` preflight returns `204` with the `ALLOWED_ORIGIN` header; oversize
+`size` returns `413`; malformed JSON returns `400`; a wrong method returns `405`;
+missing and traversal `key` values return `400`; and a valid `/upload-url` call
+returns a path-style presigned PUT on the configured endpoint with
+`X-Amz-Expires=600` and only `host` signed.
+
+Not run: nothing has ever spoken to a real bucket — no upload, download,
+listing or signed link was exercised, and the page was never opened in a
+browser. So B2's acceptance of the presigned URLs and checksum handling, the
+required bucket CORS rules, and the key's permissions are all unconfirmed.
+There are also no automated tests.
