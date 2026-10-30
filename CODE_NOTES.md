@@ -141,16 +141,13 @@ Share Tech Mono from Google Fonts, scanlines and a glitch title. It's inspired
 by the Cyberpunk 2077 site's style but uses none of its logos, artwork, fonts
 or name. Animations stop under `prefers-reduced-motion`.
 
-## Known bugs (fix before deploying)
-
-- **User IDs can be reused.** `users.id` is `INTEGER PRIMARY KEY` without
-  `AUTOINCREMENT`, so SQLite hands out the highest deleted ID again. If an
-  account is removed while objects under its `u/<id>/` folder remain, the next
-  account with that ID sees them. Today the only way to delete accounts is by
-  hand, so this needs care rather than being exploitable. The fix is
-  `AUTOINCREMENT` (needs a table-rebuild migration, because `CREATE TABLE IF
-  NOT EXISTS` won't alter an existing table) or random, non-sequential user
-  IDs. Deleting an account should also delete its `u/<id>/` objects.
+**User IDs are never reused.** `users.id` is `AUTOINCREMENT`, because
+without it SQLite hands out the highest deleted ID again, and a new account
+would see whatever was left in the old account's `u/<id>/` folder. Databases
+created before this are rebuilt on open by `migrateUsersAutoincrement`: it
+copies users into a new table with the same IDs, swaps it in with foreign keys
+off, and runs `PRAGMA foreign_key_check` before committing. Opening an
+already-migrated database does nothing.
 
 ## Known limits
 

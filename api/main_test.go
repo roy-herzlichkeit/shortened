@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -831,5 +832,91 @@ func TestLoadConfig(t *testing.T) {
 		if _, err := loadConfig(); err == nil {
 			t.Errorf("%s: loadConfig succeeded, want an error", name)
 		}
+	}
+}
+
+func TestUserIDsNotReused(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	signup(t, h, "alice")
+	signup(t, h, "bob")
+	bob := userID(t, s, "bob")
+
+	// Remove the newest account, as an admin would by hand. Without
+	// AUTOINCREMENT the next account got bob's id, and with it bob's folder.
+	if _, err := s.db.Exec(`DELETE FROM users WHERE id = ?`, bob); err != nil {
+		t.Fatal(err)
+	}
+	signup(t, h, "carol")
+	if carol := userID(t, s, "carol"); carol <= bob {
+		t.Errorf("carol got id %d, want more than deleted bob's %d", carol, bob)
+	}
+}
+
+// A database created before users.id was AUTOINCREMENT is rebuilt on open,
+// keeping ids and the rows that point at them.
+func TestMigrateUsersAutoincrement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	old, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+		`CREATE TABLE sessions (token_hash TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL)`,
+		`CREATE TABLE files (key TEXT PRIMARY KEY,
+			user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, size INTEGER NOT NULL, created_at INTEGER NOT NULL)`,
+		`INSERT INTO users VALUES (5, 'alice', 'hash', 1)`,
+		`INSERT INTO sessions VALUES ('tok', 5, 9999999999)`,
+		`INSERT INTO files VALUES ('u/5/0123456789abcdef-a.txt', 5, 10, 1)`,
+	} {
+		if _, err := old.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	old.Close()
+
+	for round := 1; round <= 2; round++ { // the second open must be a no-op
+		db, err := openDB(path)
+		if err != nil {
+			t.Fatalf("open %d: %v", round, err)
+		}
+		var ddl string
+		db.QueryRow(`SELECT sql FROM sqlite_master WHERE name = 'users'`).Scan(&ddl)
+		if !strings.Contains(ddl, "AUTOINCREMENT") {
+			t.Errorf("open %d: users table not migrated: %s", round, ddl)
+		}
+		var users, sessions, files int
+		db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = 5 AND username = 'alice'`).Scan(&users)
+		db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE user_id = 5`).Scan(&sessions)
+		db.QueryRow(`SELECT COUNT(*) FROM files WHERE user_id = 5`).Scan(&files)
+		if users != 1 || sessions != 1 || files != 1 {
+			t.Errorf("open %d: rows lost: users=%d sessions=%d files=%d", round, users, sessions, files)
+		}
+		db.Close()
+	}
+
+	// Foreign keys still cascade after the swap, and the old maximum id is
+	// never handed out again.
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`DELETE FROM users WHERE id = 5`); err != nil {
+		t.Fatal(err)
+	}
+	var sessions int
+	db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&sessions)
+	if sessions != 0 {
+		t.Errorf("sessions did not cascade after migration: %d left", sessions)
+	}
+	res, err := db.Exec(`INSERT INTO users (username, password_hash, created_at) VALUES ('bob', 'h', 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, _ := res.LastInsertId(); id <= 5 {
+		t.Errorf("new user got id %d after migration, want more than 5", id)
 	}
 }
