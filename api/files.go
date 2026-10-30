@@ -278,11 +278,7 @@ func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := s.client.DeleteObject(r.Context(), &s3.DeleteObjectInput{
-		Bucket: aws.String(s.cfg.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
+	if err := s.deleteAllVersions(r.Context(), key); err != nil {
 		log.Printf("delete %q: %v", key, err)
 		writeError(w, http.StatusBadGateway, "could not delete the file")
 		return
@@ -294,6 +290,55 @@ func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteAllVersions removes every stored version of key, and any hide markers.
+// A plain DeleteObject on B2 only adds a hide marker on top of the file, which
+// stays stored and billed, so deleting means deleting each version by ID. The
+// bucket's lifecycle rule (daysFromHidingToDeleting: 1 on u/) is the backstop
+// for anything this misses.
+func (s *server) deleteAllVersions(ctx context.Context, key string) error {
+	var versionIDs []string
+	input := &s3.ListObjectVersionsInput{
+		Bucket: aws.String(s.cfg.bucket),
+		Prefix: aws.String(key),
+	}
+	for {
+		page, err := s.client.ListObjectVersions(ctx, input)
+		if err != nil {
+			return fmt.Errorf("list versions: %w", err)
+		}
+		// Prefix matching could also return longer keys, so match exactly.
+		for _, v := range page.Versions {
+			if aws.ToString(v.Key) == key {
+				versionIDs = append(versionIDs, aws.ToString(v.VersionId))
+			}
+		}
+		for _, m := range page.DeleteMarkers {
+			if aws.ToString(m.Key) == key {
+				versionIDs = append(versionIDs, aws.ToString(m.VersionId))
+			}
+		}
+		if !aws.ToBool(page.IsTruncated) {
+			break
+		}
+		input.KeyMarker = page.NextKeyMarker
+		input.VersionIdMarker = page.NextVersionIdMarker
+	}
+
+	// One DeleteObject per version: DeleteObjects needs a request checksum,
+	// which the client deliberately doesn't send to B2. A file has one or two
+	// versions, so the extra round trips don't matter.
+	for _, id := range versionIDs {
+		if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:    aws.String(s.cfg.bucket),
+			Key:       aws.String(key),
+			VersionId: aws.String(id),
+		}); err != nil {
+			return fmt.Errorf("delete version %s: %w", id, err)
+		}
+	}
+	return nil
 }
 
 func (s *server) handleDownloadURL(w http.ResponseWriter, r *http.Request) {

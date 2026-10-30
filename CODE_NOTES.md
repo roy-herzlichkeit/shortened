@@ -116,6 +116,16 @@ itself from the file.
 `response-content-disposition=attachment; filename="<name>"`. An uploaded HTML
 or SVG file is therefore saved, not rendered on the bucket's origin.
 
+**Delete removes every version.** B2 keeps old versions: a plain
+`DeleteObject` only adds a hide marker, and the file stays stored and billed.
+`deleteAllVersions` lists the key's versions and hide markers, following the
+listing's markers across pages. It keeps only entries whose key matches
+exactly, because listing works by prefix. It then deletes each one by
+`VersionId`. Single `DeleteObject` calls are used because `DeleteObjects`
+needs a request checksum, which this client deliberately doesn't send to B2.
+As a backstop, the bucket has a lifecycle rule (`daysFromHidingToDeleting: 1`
+on `u/`) that purges anything hidden by other means within about a day.
+
 **B2 specifics.** `UsePathStyle` plus `B2_ENDPOINT` makes the SDK address
 `endpoint/bucket/key`. `RequestChecksumCalculation = WhenRequired` stops the
 SDK adding CRC32 headers, which B2 rejects with a 400.
@@ -130,6 +140,14 @@ near-black, cyan and red accents, cut-corner panels and buttons, Rajdhani and
 Share Tech Mono from Google Fonts, scanlines and a glitch title. It's inspired
 by the Cyberpunk 2077 site's style but uses none of its logos, artwork, fonts
 or name. Animations stop under `prefers-reduced-motion`.
+
+**User IDs are never reused.** `users.id` is `AUTOINCREMENT`, because
+without it SQLite hands out the highest deleted ID again, and a new account
+would see whatever was left in the old account's `u/<id>/` folder. Databases
+created before this are rebuilt on open by `migrateUsersAutoincrement`: it
+copies users into a new table with the same IDs, swaps it in with foreign keys
+off, and runs `PRAGMA foreign_key_check` before committing. Opening an
+already-migrated database does nothing.
 
 ## Known limits
 
@@ -169,9 +187,43 @@ or directly:
 CGO_ENABLED=0 GOOS=linux go build -o server ./api
 ```
 
-Then open `http://localhost:8080`. The bucket needs a CORS rule allowing `PUT`
-(with the `Content-Type` header) and `GET` from the site's origin, because
-uploads and downloads go straight to B2.
+Then open `http://localhost:8080`. Use `localhost`, not `127.0.0.1`: the CORS
+rule names the exact origin.
+
+### B2 setup (once per bucket)
+
+1. Create a **private** bucket. Turn on default encryption (SSE-B2) and leave
+   Object Lock **off**, because Object Lock would block deletes.
+2. Create an application key limited to that bucket, with read and write
+   access.
+3. Add a CORS rule. Uploads and downloads go straight from the browser to B2,
+   so the bucket must allow the site's origin. Use the `b2` CLI (`pip install
+   b2`, then `b2 account authorize`). The web UI only accepts HTTPS origins.
+   From Git Bash, not PowerShell 5.1, which strips the inner quotes:
+
+   ```
+   b2 bucket update --cors-rules '[{"corsRuleName":"shortened-local","allowedOrigins":["http://localhost:8080"],"allowedOperations":["s3_put","s3_get"],"allowedHeaders":["content-type"],"exposeHeaders":["ETag"],"maxAgeSeconds":3600}]' <bucket> allPrivate
+   ```
+
+   For a deployment, add the real `https://` origin to `allowedOrigins`.
+4. Add the lifecycle rule that purges hidden file versions after a day. It is
+   the backstop for the app's delete, which already removes every version:
+
+   ```
+   b2 bucket update --lifecycle-rule '{"daysFromHidingToDeleting":1,"daysFromUploadingToHiding":null,"fileNamePrefix":"u/"}' <bucket> allPrivate
+   ```
+
+   `bucket update` replaces all lifecycle rules at once. Check
+   `b2 bucket get <bucket>` first, and include any rules you want to keep.
+
+### Running on Windows without Docker
+
+The server reads environment variables, not `.env` itself. In PowerShell:
+
+```
+Get-Content .env | Where-Object { $_ -match '^\s*[^#].*=' } | ForEach-Object { $k,$v = $_ -split '=',2; Set-Item "env:$($k.Trim())" ($v -replace '\s+#.*$','').Trim() }
+go run ./api
+```
 
 ## Checks run, and what was not
 
@@ -188,10 +240,45 @@ The built server was also run locally against fake B2 credentials. These
 worked: the page loaded in Chrome with no console errors, sign-up, sign-in and
 `/auth/me`, and the error message when listing failed.
 
+**End to end against a real B2 bucket**, on 2026-10-30, with curl:
+
+- sign-up worked, and the upload URL was signed inside `u/<id>/`;
+- the PUT to B2 returned `200`;
+- **a PUT with a different body size got `403` from B2**, which confirms the
+  signed `Content-Length` binds;
+- the listing showed the file, and usage matched;
+- the download returned `200` with `Content-Disposition: attachment` and
+  byte-identical content;
+- the CORS preflight from `http://localhost:8080` was allowed;
+- delete returned `204`, and both the listing and the usage went back to
+  zero.
+
+The user also uploaded a file through the page in Chrome successfully. That run
+showed the old delete only hid files; the fix was then verified on the real
+bucket on the same day. A file with two stored versions had no versions left
+after one app delete (checked with `b2 ls --versions`).
+
+**Tests are fast and timing-free.** `TestMain` drops bcrypt to `MinCost`, so
+the suite runs in about 2 s locally; CI's `-race` run had taken 105 s. The
+rate-limit test uses a limiter that never refills; with the real one, slow
+`-race` runs earned back a token and the test failed. Mutation checks confirm
+the delete test fails if any of these is removed: deleting by version, the
+exact-key filter, or following pagination. The fake B2 keeps versions and
+rejects foreign version IDs, as B2 does.
+
+**Phone layout**, checked with headless Chrome at 390 and 320 px wide, and with
+a 120-character file name:
+
+- no horizontal overflow;
+- long names end in an ellipsis;
+- every button is at least 40 px tall.
+
+This check found and fixed a real bug. The panel column was a CSS grid item
+with the default `min-width: auto`, so one long file name widened the page
+past the screen. It is now `grid-template-columns: minmax(0, 1fr)`.
+
 Not run:
 
-- A real bucket has never been used, so no actual upload, download, listing or
-  delete has happened.
-- The Docker image has not been rebuilt, `go test -race` has not been run, and
-  the CI smoke test has not run (Docker was unavailable locally).
-- The phone-width layout has not been checked in a browser.
+- The Docker image has not been rebuilt locally (Docker Desktop was not
+  running). CI builds it and runs the smoke test.
+- Nothing has been deployed anywhere other than localhost.

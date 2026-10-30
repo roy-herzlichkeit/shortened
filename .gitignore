@@ -11,3 +11,6 @@
 # Build output
 /server
 /server.exe
+
+# Agent handoff docs and scratch scripts (kept local on purpose)
+.agent/
