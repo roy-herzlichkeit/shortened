@@ -86,18 +86,20 @@ jobs:
       - name: Build image
         run: docker build -t shortened-api:ci .
 
-      # Fake credentials are enough: presigning is local, and nothing here
-      # lists or deletes, so the container never has to reach B2.
+      # Fake credentials are enough: presigning is local, and the smoke test
+      # never lists or deletes, so the container never has to reach B2.
+      # COOKIE_SECURE=false because curl talks plain HTTP to 127.0.0.1.
       - name: Start container
         run: |
+          docker volume create shortened-data
           docker run -d --name api -p 8080:8080 \
+            -v shortened-data:/data \
             -e B2_KEY_ID=0000000000000000000000001 \
             -e B2_APP_KEY=K0000000000000000000000000000000 \
             -e B2_ENDPOINT=https://s3.us-west-004.backblazeb2.com \
             -e B2_REGION=us-west-004 \
             -e B2_BUCKET=ci-bucket \
-            -e API_KEY=ci-api-key \
-            -e ALLOWED_ORIGIN=http://localhost:8000 \
+            -e COOKIE_SECURE=false \
             shortened-api:ci
 
       - name: HEALTHCHECK reports healthy
@@ -124,18 +126,45 @@ jobs:
             fi
           }
 
+          jar=/tmp/cookies
+          json='Content-Type: application/json'
+
+          # Page and health
           expect 200 "$base/health"
+          expect 200 "$base/"
+          grep -q '<title>SHORTENED.</title>' /tmp/body || { echo "page not served"; exit 1; }
+          curl -sI "$base/" | grep -qi '^content-security-policy:' || { echo "page has no CSP"; exit 1; }
+          expect 200 "$base/app.js"
+          expect 200 "$base/style.css"
+
+          # Everything else needs a session
           expect 401 "$base/files"
-          expect 401 -H 'X-API-Key: wrong' "$base/files"
-          expect 204 -X OPTIONS "$base/upload-url"
-          expect 413 -H 'X-API-Key: ci-api-key' -d '{"filename":"a.bin","size":52428801}' "$base/upload-url"
-          expect 400 -H 'X-API-Key: ci-api-key' "$base/download-url?key=..%2Fsecret"
+          expect 401 "$base/auth/me"
 
-          expect 200 -H 'X-API-Key: ci-api-key' -d '{"filename":"my..file.txt","size":12}' "$base/upload-url"
-          grep -q 'content-length' /tmp/body || { echo "upload URL does not sign content-length"; cat /tmp/body; exit 1; }
+          # Sign up, then the session works
+          expect 201 -c "$jar" -H "$json" -d '{"username":"ci-user","password":"ci-password-123"}' "$base/auth/signup"
+          grep -q 'HttpOnly' "$jar" || grep -q '#HttpOnly_' "$jar" || { echo "session cookie is not HttpOnly"; cat "$jar"; exit 1; }
+          expect 200 -b "$jar" "$base/auth/me"
+          grep -q '"username":"ci-user"' /tmp/body || { echo "wrong user"; cat /tmp/body; exit 1; }
+          expect 409 -H "$json" -d '{"username":"CI-USER","password":"another-password"}' "$base/auth/signup"
+          expect 401 -H "$json" -d '{"username":"ci-user","password":"wrong-password"}' "$base/auth/login"
+          expect 403 -b "$jar" -H "$json" -H 'Origin: https://evil.example' -d '{"filename":"a","size":1}' "$base/upload-url"
 
-          expect 200 -H 'X-API-Key: ci-api-key' "$base/download-url?key=0123456789abcdef-my..file.txt"
+          # Signing, with the size bound into the upload URL
+          expect 413 -b "$jar" -H "$json" -d '{"filename":"a.bin","size":52428801}' "$base/upload-url"
+          expect 400 -b "$jar" "$base/download-url?key=..%2Fsecret"
+          expect 404 -b "$jar" "$base/download-url?key=u%2F999%2F0123456789abcdef-theirs.txt"
+          expect 200 -b "$jar" "$base/download-url?key=u%2F1%2F0123456789abcdef-my..file.txt"
           grep -q 'response-content-disposition=attachment' /tmp/body || { echo "download URL is not an attachment"; cat /tmp/body; exit 1; }
+
+          # Sign out ends the session
+          expect 204 -b "$jar" -X POST "$base/auth/logout"
+          expect 401 -b "$jar" "$base/auth/me"
+
+          # Accounts survive a restart because they live on the volume
+          docker restart api
+          for _ in $(seq 1 20); do curl -sf "$base/health" >/dev/null && break; sleep 1; done
+          expect 200 -c "$jar" -H "$json" -d '{"username":"ci-user","password":"ci-password-123"}' "$base/auth/login"
 
       - name: Stops gracefully on SIGTERM
         run: |
@@ -159,19 +188,31 @@ jobs:
       - name: html-validate
         run: npx --yes html-validate@9.7.1 web/index.html
 
-      - name: Inline script parses
-        run: |
-          node -e '
-            const html = require("fs").readFileSync("web/index.html", "utf8");
-            const m = html.match(/<script>([\s\S]*?)<\/script>/);
-            if (!m) { console.error("no inline <script> found"); process.exit(1); }
-            new Function(m[1]); // parses without running it
-          '
+      - name: Script parses
+        run: node --check web/app.js
 
-      - name: API address is not taken from the URL
+      # The CSP forbids inline scripts, so an inline <script> would silently
+      # not run in production.
+      - name: No inline scripts or handlers
         run: |
-          if grep -nE 'location\.(search|hash)|URLSearchParams' web/index.html; then
-            echo "The page must not read the API address from the URL: a crafted link could leak the API key."
+          if grep -nE '<script>|<script [^>]*>[^<]|\son[a-z]+=' web/index.html; then
+            echo "Inline scripts and on*= handlers are blocked by the page's CSP; put code in app.js."
+            exit 1
+          fi
+
+      # File names come from users; building HTML from them would be XSS.
+      - name: No HTML built from strings
+        run: |
+          if grep -nE 'innerHTML|outerHTML|insertAdjacentHTML|document\.write' web/app.js; then
+            echo "Use textContent and createElement instead."
+            exit 1
+          fi
+
+      # The session cookie is HttpOnly; nothing should try to keep auth in storage.
+      - name: No credentials in browser storage
+        run: |
+          if grep -nE 'localStorage|sessionStorage|document\.cookie' web/app.js; then
+            echo "Auth lives in the HttpOnly session cookie only."
             exit 1
           fi
 

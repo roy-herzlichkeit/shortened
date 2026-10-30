@@ -3,282 +3,105 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- Address of the Go API. Edit this when the API is deployed somewhere else. -->
-<meta name="api-url" content="http://localhost:8080">
-<title>File Share</title>
-<style>
-  :root { color-scheme: light dark; }
-  body {
-    margin: 0;
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-    background: #f4f5f7;
-    color: #1b1f24;
-  }
-  main { max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  p.lede { margin: 0 0 24px; color: #5b6572; font-size: 14px; }
-  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
-  input[type="password"], input[type="file"] {
-    width: 100%; box-sizing: border-box; padding: 9px 11px;
-    border: 1px solid #c9cfd8; border-radius: 8px; background: #fff; color: inherit;
-    font: inherit;
-  }
-  button {
-    font: inherit; font-weight: 600; padding: 9px 16px; border-radius: 8px;
-    border: 1px solid #1f6feb; background: #1f6feb; color: #fff; cursor: pointer;
-  }
-  button:disabled { opacity: .5; cursor: progress; }
-  .row { display: flex; gap: 10px; margin-top: 18px; align-items: stretch; flex-wrap: wrap; }
-  .row input[type="file"] { flex: 1 1 260px; width: auto; }
-  #status { min-height: 22px; margin: 14px 0 0; font-size: 14px; color: #5b6572; }
-  #status.error { color: #c0392b; }
-  h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .06em; color: #5b6572; margin: 32px 0 10px; }
-  ul { list-style: none; margin: 0; padding: 0; border: 1px solid #dde2e9; border-radius: 10px; background: #fff; overflow: hidden; }
-  li { display: flex; gap: 12px; align-items: center; padding: 11px 14px; border-top: 1px solid #eef1f5; }
-  li:first-child { border-top: 0; }
-  li.empty { color: #8a94a1; justify-content: center; }
-  .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; }
-  .meta { flex: 0 0 auto; font-size: 12px; color: #7a8492; }
-  li button { padding: 5px 11px; font-size: 13px; }
-  button.secondary { background: transparent; color: #1f6feb; }
-  button.danger { background: transparent; border-color: #c0392b; color: #c0392b; }
-  progress { width: 100%; height: 6px; margin-top: 10px; }
-  progress[hidden] { display: none; }
-  .list-head { display: flex; align-items: baseline; justify-content: space-between; }
-  .list-head button { padding: 4px 10px; font-size: 13px; }
-  @media (prefers-color-scheme: dark) {
-    body { background: #14171c; color: #e6e9ee; }
-    input[type="password"], input[type="file"], ul { background: #1b1f26; border-color: #2c333d; }
-    li { border-color: #232a33; }
-    #status, p.lede, h2, .meta { color: #97a2b1; }
-  }
-</style>
+<title>SHORTENED.</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&amp;family=Share+Tech+Mono&amp;display=swap">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">//</span>
+    <span class="brand-name">Shortened<span class="brand-dot">.</span></span>
+  </div>
+  <div id="account" class="account" hidden>
+    <span class="account-label">User</span>
+    <span id="whoami" class="account-name"></span>
+    <button id="logout" class="btn btn-ghost btn-small" type="button">Sign out</button>
+  </div>
+</header>
+
 <main>
-  <h1>File Share</h1>
-  <p class="lede">Files upload straight from this browser to the bucket. The API only signs links.</p>
+  <section class="hero">
+    <p class="hero-kicker">Secure transfer protocol <span class="blink" aria-hidden="true">_</span></p>
+    <h1 class="glitch">
+      <span>Upload. Store. Share.</span>
+      <span class="glitch-layer" aria-hidden="true">Upload. Store. Share.</span>
+      <span class="glitch-layer" aria-hidden="true">Upload. Store. Share.</span>
+    </h1>
+    <p class="hero-sub">Files go straight from your browser to cloud storage. Only you can see yours, and every link self-destructs after 10 minutes.</p>
+  </section>
 
-  <label for="api-key">API key</label>
-  <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="X-API-Key">
+  <section id="auth-view" class="frame" aria-labelledby="auth-title" hidden>
+    <div class="frame-inner">
+      <h2 id="auth-title" class="frame-title"><span class="tag">01</span> Access terminal</h2>
 
-  <div class="row">
-    <input id="file" type="file" aria-label="Choose a file">
-    <button id="upload" type="button">Upload</button>
-  </div>
+      <div class="switch">
+        <button id="mode-login" class="switch-option" type="button" aria-pressed="true">Sign in</button>
+        <button id="mode-signup" class="switch-option" type="button" aria-pressed="false">Sign up</button>
+      </div>
 
-  <progress id="progress" max="100" value="0" hidden></progress>
-  <p id="status" role="status" aria-live="polite"></p>
+      <form id="auth-form" class="form" novalidate>
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" spellcheck="false"
+               required minlength="3" maxlength="32" pattern="[A-Za-z0-9_\-]+">
 
-  <div class="list-head">
-    <h2>Files</h2>
-    <button id="refresh" class="secondary" type="button">Refresh</button>
-  </div>
-  <ul id="files"><li class="empty">Enter your API key to list files.</li></ul>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password"
+               required minlength="8" maxlength="72">
+
+        <p id="auth-hint" class="hint">Welcome back, choom.</p>
+        <button id="auth-submit" class="btn btn-primary" type="submit">Sign in</button>
+      </form>
+    </div>
+  </section>
+
+  <section id="app-view" class="stack" hidden>
+    <div class="frame">
+      <div class="frame-inner">
+        <h2 class="frame-title"><span class="tag">02</span> Upload</h2>
+
+        <div class="meter" id="usage">
+          <div class="meter-head">
+            <span>Storage</span>
+            <span id="usage-text" class="mono">0 B / 0 B</span>
+          </div>
+          <div class="bar"><div id="usage-bar" class="bar-fill"></div></div>
+        </div>
+
+        <div class="upload-row">
+          <label class="file-pick">
+            <input id="file" type="file">
+            <span class="file-pick-button">Choose file</span>
+            <span id="file-name" class="file-pick-name mono">No file selected</span>
+          </label>
+          <button id="upload" class="btn btn-primary" type="button">Upload</button>
+        </div>
+
+        <div id="progress" class="bar bar-progress" hidden><div id="progress-bar" class="bar-fill"></div></div>
+      </div>
+    </div>
+
+    <div class="frame">
+      <div class="frame-inner">
+        <div class="list-head">
+          <h2 class="frame-title"><span class="tag">03</span> Your files</h2>
+          <button id="refresh" class="btn btn-ghost btn-small" type="button">Refresh</button>
+        </div>
+        <ul id="files" class="files"><li class="empty">Loading…</li></ul>
+      </div>
+    </div>
+  </section>
+
+  <p id="status" class="status" role="status" aria-live="polite"></p>
 </main>
-<script>
-  // Address of the Go API, from the api-url meta tag. It is deliberately not
-  // read from the query string: a crafted link could then send the API key to
-  // someone else's server.
-  const API_URL = document.querySelector('meta[name="api-url"]').content.replace(/\/+$/, "");
-  const MAX_BYTES = 50 * 1024 * 1024;
 
-  const keyInput = document.getElementById("api-key");
-  const fileInput = document.getElementById("file");
-  const uploadButton = document.getElementById("upload");
-  const refreshButton = document.getElementById("refresh");
-  const progressEl = document.getElementById("progress");
-  const statusEl = document.getElementById("status");
-  const filesEl = document.getElementById("files");
+<footer class="footer mono">
+  <span>// Max 50 MB per file</span>
+  <span>// Signed links expire in 10 min</span>
+</footer>
 
-  function setStatus(text, kind) {
-    statusEl.textContent = text;
-    statusEl.className = kind || "";
-  }
-
-  function requireKey() {
-    const key = keyInput.value.trim();
-    if (!key) throw new Error("Enter the API key first.");
-    return key;
-  }
-
-  async function api(pathAndQuery, options) {
-    const settings = options || {};
-    const headers = Object.assign({ "X-API-Key": requireKey() }, settings.headers || {});
-    const res = await fetch(API_URL + pathAndQuery, Object.assign({}, settings, { headers }));
-    let body = null;
-    if (res.status !== 204) {
-      try {
-        body = await res.json();
-      } catch (_) {
-        // A non-JSON body is reported through the status code below.
-      }
-    }
-    if (!res.ok) {
-      throw new Error((body && body.error) || "Request failed with HTTP " + res.status);
-    }
-    return body;
-  }
-
-  function formatBytes(bytes) {
-    if (bytes < 1024) return bytes + " B";
-    const units = ["KB", "MB", "GB", "TB"];
-    let value = bytes;
-    let unit = -1;
-    do {
-      value /= 1024;
-      unit += 1;
-    } while (value >= 1024 && unit < units.length - 1);
-    return (value < 10 ? value.toFixed(1) : Math.round(value)) + " " + units[unit];
-  }
-
-  function renderFiles(files) {
-    filesEl.replaceChildren();
-    if (!files || files.length === 0) {
-      const empty = document.createElement("li");
-      empty.className = "empty";
-      empty.textContent = "No files yet.";
-      filesEl.append(empty);
-      return;
-    }
-    for (const file of files) {
-      const item = document.createElement("li");
-
-      const name = document.createElement("span");
-      name.className = "name";
-      name.textContent = file.name || file.key;
-      name.title = file.key;
-
-      const meta = document.createElement("span");
-      meta.className = "meta";
-      const when = file.lastModified ? new Date(file.lastModified).toLocaleString() : "";
-      meta.textContent = formatBytes(file.size) + (when ? " · " + when : "");
-
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = "Download";
-      button.addEventListener("click", function () {
-        download(file, button);
-      });
-
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "danger";
-      remove.textContent = "Delete";
-      remove.addEventListener("click", function () {
-        deleteFile(file, remove);
-      });
-
-      item.append(name, meta, button, remove);
-      filesEl.append(item);
-    }
-  }
-
-  async function loadFiles() {
-    const files = await api("/files");
-    renderFiles(files);
-  }
-
-  function refresh() {
-    if (!keyInput.value.trim()) return;
-    loadFiles().catch(function (err) {
-      setStatus(err.message, "error");
-    });
-  }
-
-  async function download(file, button) {
-    button.disabled = true;
-    setStatus("Signing a link for " + (file.name || file.key) + "…");
-    try {
-      const signed = await api("/download-url?key=" + encodeURIComponent(file.key));
-      // The signed link answers with Content-Disposition: attachment, so the
-      // page stays put while the browser saves the file.
-      setStatus("Link signed; your browser should start the download.");
-      window.location.href = signed.url;
-    } catch (err) {
-      setStatus(err.message, "error");
-    } finally {
-      button.disabled = false;
-    }
-  }
-
-  async function deleteFile(file, button) {
-    if (!confirm("Delete " + (file.name || file.key) + "? This cannot be undone.")) return;
-    button.disabled = true;
-    try {
-      await api("/files?key=" + encodeURIComponent(file.key), { method: "DELETE" });
-      setStatus("Deleted " + (file.name || file.key) + ".");
-      await loadFiles();
-    } catch (err) {
-      setStatus(err.message, "error");
-      button.disabled = false;
-    }
-  }
-
-  // fetch() cannot report upload progress, so the PUT to the bucket uses XHR.
-  function putWithProgress(url, file) {
-    return new Promise(function (resolve, reject) {
-      const xhr = new XMLHttpRequest();
-      xhr.open("PUT", url);
-      xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
-      xhr.upload.addEventListener("progress", function (e) {
-        if (e.lengthComputable) progressEl.value = Math.round((e.loaded / e.total) * 100);
-      });
-      xhr.addEventListener("load", function () {
-        if (xhr.status >= 200 && xhr.status < 300) resolve();
-        else reject(new Error("Upload failed with HTTP " + xhr.status));
-      });
-      xhr.addEventListener("error", function () {
-        reject(new Error("Upload failed: the bucket could not be reached (check its CORS rules)."));
-      });
-      xhr.send(file);
-    });
-  }
-
-  async function upload() {
-    const file = fileInput.files[0];
-    if (!file) {
-      setStatus("Choose a file first.", "error");
-      return;
-    }
-    if (file.size > MAX_BYTES) {
-      setStatus("Files must be 50 MB or smaller.", "error");
-      return;
-    }
-
-    uploadButton.disabled = true;
-    try {
-      setStatus("Requesting an upload link…");
-      const signed = await api("/upload-url", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name, size: file.size })
-      });
-
-      setStatus("Uploading " + file.name + "…");
-      progressEl.value = 0;
-      progressEl.hidden = false;
-      await putWithProgress(signed.url, file);
-
-      fileInput.value = "";
-      setStatus("Upload complete.");
-      await loadFiles();
-    } catch (err) {
-      setStatus(err.message, "error");
-    } finally {
-      progressEl.hidden = true;
-      uploadButton.disabled = false;
-    }
-  }
-
-  uploadButton.addEventListener("click", upload);
-  refreshButton.addEventListener("click", refresh);
-
-  // "change" alone only fires on blur, so Enter loads the list as well.
-  keyInput.addEventListener("change", refresh);
-  keyInput.addEventListener("keydown", function (e) {
-    if (e.key === "Enter") refresh();
-  });
-</script>
+<script src="app.js"></script>
 </body>
 </html>
