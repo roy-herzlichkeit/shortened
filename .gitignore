@@ -3,6 +3,11 @@
 .env.*
 !.env.example
 
+# Local SQLite database (accounts and password hashes)
+*.db
+*.db-wal
+*.db-shm
+
 # Build output
 /server
 /server.exe
