@@ -100,7 +100,10 @@ main {
   padding: 40px 16px 48px;
 }
 
-.stack { display: grid; gap: 22px; }
+/* minmax(0, 1fr): a grid column otherwise grows to its widest unbreakable
+   content, so one long file name pushed the panels past a phone's screen
+   instead of being cut off with an ellipsis. */
+.stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; }
 
 /* ---------- Hero ---------- */
 
@@ -237,6 +240,7 @@ main {
 /* ---------- Buttons ---------- */
 
 .btn {
+  white-space: nowrap;
   --btn-cut: 10px;
   display: inline-flex;
   align-items: center;
@@ -412,6 +416,8 @@ main {
   .upload-row .btn { flex: 1 1 100%; }
   .file-actions { width: 100%; }
   .file-actions .btn { flex: 1; }
+  /* Fingers need bigger targets than mouse pointers. */
+  .btn-small { min-height: 40px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

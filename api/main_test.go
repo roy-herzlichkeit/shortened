@@ -7,12 +7,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 const testEndpoint = "https://s3.us-west-004.backblazeb2.com"
@@ -27,6 +30,13 @@ func testConfig(endpoint string) config {
 		quotaBytes:   500 << 20,
 		cookieSecure: true,
 	}
+}
+
+func TestMain(m *testing.M) {
+	// Hashing at cost 12 dominates the suite's run time, and the cost isn't
+	// what the tests check.
+	bcryptCost = bcrypt.MinCost
+	os.Exit(m.Run())
 }
 
 // newTestServer builds the real handler stack on a fresh database. Presigning
@@ -295,7 +305,11 @@ func TestCrossOriginRefused(t *testing.T) {
 }
 
 func TestLoginRateLimited(t *testing.T) {
-	_, h := newTestServer(t, testConfig(testEndpoint))
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	// A limiter that never refills during the test. With the real one (a token
+	// every 6s), slow runs such as -race in CI earned back a token before the
+	// 11th attempt and the test failed.
+	s.limiter = newIPLimiter(time.Hour, 10)
 	body := creds("nobody", "whatever123")
 	for i := 0; i < 10; i++ {
 		if rec := do(t, h, http.MethodPost, "/auth/login", body, withRemoteAddr("192.0.2.7:1000")); rec.Code != http.StatusUnauthorized {
@@ -329,48 +343,84 @@ func TestClientIPTrustProxy(t *testing.T) {
 
 /* ---------- Fake bucket ---------- */
 
-type fakeObject struct {
+type fakeVersion struct {
+	id       string
 	size     int64
 	modified time.Time
+	marker   bool // a B2 "hide" marker (S3 delete marker)
 }
 
-// fakeB2 answers just enough of the S3 API for ListObjectsV2 (with a prefix)
-// and DeleteObject, holding objects in memory.
+// fakeB2 answers just enough of the S3 API for ListObjectsV2,
+// ListObjectVersions and DeleteObject. Like B2, it keeps every version: a
+// DeleteObject without a version ID only adds a hide marker, and one with a
+// version ID removes that version for good.
 type fakeB2 struct {
-	mu      sync.Mutex
-	objects map[string]fakeObject
+	mu       sync.Mutex
+	versions map[string][]fakeVersion // oldest first
+	nextID   int
+	pageSize int // ListObjectVersions entries per page
 }
 
 func newFakeB2(t *testing.T) (*fakeB2, string) {
-	f := &fakeB2{objects: map[string]fakeObject{}}
+	f := &fakeB2{versions: map[string][]fakeVersion{}, pageSize: 1000}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return f, srv.URL
 }
 
+func (f *fakeB2) newID() string {
+	f.nextID++
+	return fmt.Sprintf("v%04d", f.nextID)
+}
+
+// put stores a new version of key, as an upload would.
 func (f *fakeB2) put(key string, size int64, modified time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.objects[key] = fakeObject{size: size, modified: modified}
+	f.versions[key] = append(f.versions[key], fakeVersion{id: f.newID(), size: size, modified: modified})
 }
 
+// hide adds a hide marker on top of key, as a plain DeleteObject would.
+func (f *fakeB2) hide(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.versions[key] = append(f.versions[key], fakeVersion{id: f.newID(), modified: time.Now(), marker: true})
+}
+
+func (f *fakeB2) setPageSize(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pageSize = n
+}
+
+// has reports whether key is visible, i.e. its latest version is not a marker.
 func (f *fakeB2) has(key string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	_, ok := f.objects[key]
-	return ok
+	vs := f.versions[key]
+	return len(vs) > 0 && !vs[len(vs)-1].marker
 }
+
+// stored counts every version and marker kept for key.
+func (f *fakeB2) stored(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.versions[key])
+}
+
+func xmlTime(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
 
 func (f *fakeB2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	q := r.URL.Query()
 
 	switch {
-	case r.Method == http.MethodGet && r.URL.Path == "/test-bucket" && r.URL.Query().Get("list-type") == "2":
-		prefix := r.URL.Query().Get("prefix")
+	case r.Method == http.MethodGet && r.URL.Path == "/test-bucket" && q.Get("list-type") == "2":
+		prefix := q.Get("prefix")
 		var keys []string
-		for k := range f.objects {
-			if strings.HasPrefix(k, prefix) {
+		for k, vs := range f.versions {
+			if strings.HasPrefix(k, prefix) && len(vs) > 0 && !vs[len(vs)-1].marker {
 				keys = append(keys, k)
 			}
 		}
@@ -380,17 +430,95 @@ func (f *fakeB2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
 		fmt.Fprintf(&b, `<Name>test-bucket</Name><KeyCount>%d</KeyCount><IsTruncated>false</IsTruncated>`, len(keys))
 		for _, k := range keys {
-			o := f.objects[k]
+			v := f.versions[k][len(f.versions[k])-1]
 			fmt.Fprintf(&b, `<Contents><Key>%s</Key><LastModified>%s</LastModified><Size>%d</Size></Contents>`,
-				k, o.modified.UTC().Format("2006-01-02T15:04:05.000Z"), o.size)
+				k, xmlTime(v.modified), v.size)
 		}
 		b.WriteString(`</ListBucketResult>`)
 		w.Header().Set("Content-Type", "application/xml")
 		w.Write([]byte(b.String()))
 
+	case r.Method == http.MethodGet && r.URL.Path == "/test-bucket" && q.Has("versions"):
+		// Every version of every matching key, keys ascending and each key's
+		// versions newest first, paged after (key-marker, version-id-marker).
+		type entry struct {
+			key string
+			v   fakeVersion
+		}
+		var keys []string
+		for k := range f.versions {
+			if strings.HasPrefix(k, q.Get("prefix")) {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		var all []entry
+		for _, k := range keys {
+			vs := f.versions[k]
+			for i := len(vs) - 1; i >= 0; i-- {
+				all = append(all, entry{k, vs[i]})
+			}
+		}
+		start := 0
+		if km := q.Get("key-marker"); km != "" {
+			for i, e := range all {
+				if e.key == km && e.v.id == q.Get("version-id-marker") {
+					start = i + 1
+					break
+				}
+			}
+		}
+		page := all[start:]
+		truncated := len(page) > f.pageSize
+		if truncated {
+			page = page[:f.pageSize]
+		}
+
+		var b strings.Builder
+		b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+		fmt.Fprintf(&b, `<Name>test-bucket</Name><IsTruncated>%t</IsTruncated>`, truncated)
+		if truncated {
+			last := page[len(page)-1]
+			fmt.Fprintf(&b, `<NextKeyMarker>%s</NextKeyMarker><NextVersionIdMarker>%s</NextVersionIdMarker>`, last.key, last.v.id)
+		}
+		for _, e := range page {
+			latest := f.versions[e.key][len(f.versions[e.key])-1].id == e.v.id
+			if e.v.marker {
+				fmt.Fprintf(&b, `<DeleteMarker><Key>%s</Key><VersionId>%s</VersionId><IsLatest>%t</IsLatest><LastModified>%s</LastModified></DeleteMarker>`,
+					e.key, e.v.id, latest, xmlTime(e.v.modified))
+			} else {
+				fmt.Fprintf(&b, `<Version><Key>%s</Key><VersionId>%s</VersionId><IsLatest>%t</IsLatest><LastModified>%s</LastModified><Size>%d</Size></Version>`,
+					e.key, e.v.id, latest, xmlTime(e.v.modified), e.v.size)
+			}
+		}
+		b.WriteString(`</ListVersionsResult>`)
+		w.Header().Set("Content-Type", "application/xml")
+		w.Write([]byte(b.String()))
+
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/test-bucket/"):
 		key, _ := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/test-bucket/"))
-		delete(f.objects, key)
+		id := q.Get("versionId")
+		if id == "" {
+			f.versions[key] = append(f.versions[key], fakeVersion{id: f.newID(), modified: time.Now(), marker: true})
+		} else {
+			vs := f.versions[key]
+			found := false
+			for i, v := range vs {
+				if v.id == id {
+					f.versions[key] = append(vs[:i:i], vs[i+1:]...)
+					found = true
+					break
+				}
+			}
+			if !found {
+				// Like B2 and S3: a version ID that isn't one of this key's.
+				http.Error(w, "<Error><Code>InvalidArgument</Code><Message>Invalid version id specified</Message></Error>", http.StatusBadRequest)
+				return
+			}
+			if len(f.versions[key]) == 0 {
+				delete(f.versions, key)
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 
 	default:
@@ -563,14 +691,31 @@ func TestDeleteFile(t *testing.T) {
 	s, h := newTestServer(t, testConfig(endpoint))
 	c := signup(t, h, "alice")
 	key := userPrefix(userID(t, s, "alice")) + "0123456789abcdef-a.txt"
+	// A key that starts with the deleted one must survive: version listing
+	// matches by prefix.
+	neighbour := key + "x"
 	b2.put(key, 10, time.Now())
-	do(t, h, http.MethodGet, "/files", "", withCookie(c)) // puts the object in the ledger
+	b2.put(neighbour, 5, time.Now())
+	do(t, h, http.MethodGet, "/files", "", withCookie(c)) // puts the objects in the ledger
+
+	// Older versions and a hide marker, as B2 keeps them, spread over
+	// one-entry pages so the listing has to follow its markers.
+	b2.hide(key)
+	b2.put(key, 12, time.Now())
+	b2.setPageSize(1)
 
 	if rec := do(t, h, http.MethodDelete, "/files?key="+url.QueryEscape(key), "", withCookie(c)); rec.Code != http.StatusNoContent {
 		t.Fatalf("status %d, body %s", rec.Code, rec.Body)
 	}
-	if b2.has(key) {
-		t.Error("object still in the bucket")
+	if n := b2.stored(key); n != 0 {
+		t.Errorf("%d versions or markers of the file still stored; a delete must remove all of them", n)
+	}
+	if !b2.has(neighbour) || b2.stored(neighbour) != 1 {
+		t.Error("deleting a file touched a different file that shares its prefix")
+	}
+	b2.setPageSize(1000)
+	if rec := do(t, h, http.MethodDelete, "/files?key="+url.QueryEscape(neighbour), "", withCookie(c)); rec.Code != http.StatusNoContent {
+		t.Fatalf("delete neighbour: status %d", rec.Code)
 	}
 	if me := decode[meResponse](t, do(t, h, http.MethodGet, "/auth/me", "", withCookie(c))); me.UsedBytes != 0 {
 		t.Errorf("used after delete = %d, want 0", me.UsedBytes)
