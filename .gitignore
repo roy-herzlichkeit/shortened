@@ -1,0 +1,8 @@
+# Real credentials live here; only .env.example is committed.
+.env
+.env.*
+!.env.example
+
+# Build output
+/server
+/server.exe

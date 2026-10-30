@@ -7,10 +7,12 @@ bucket that holds the bytes, and one HTML page that talks to both.
 
 | Path | What it is |
 | --- | --- |
-| [api/main.go](api/main.go) | The whole API: config loading, B2 client, four handlers, CORS/API-key middleware. |
-| [web/index.html](web/index.html) | The whole UI: API key field, file picker, Upload button, file list with Download links. Plain HTML + JS, no build step. |
-| [Dockerfile](Dockerfile) | Multi-stage build (`golang:1.27-alpine` → `alpine:3.20`), `CGO_ENABLED=0`, binary only in the final image. |
-| [.env.example](.env.example) | Every environment variable with fake values. |
+| [api/main.go](api/main.go) | The whole API: config loading, B2 client, four handlers, CORS/API-key middleware, graceful shutdown. |
+| [api/main_test.go](api/main_test.go) | Unit and handler tests. Signing is checked offline, and list/delete run against an in-process fake S3 endpoint. |
+| [web/index.html](web/index.html) | The whole UI: API key field, file picker with upload progress, file list with Download and Delete buttons. Plain HTML + JS, no build step. |
+| [Dockerfile](Dockerfile) | Multi-stage build (`golang:1.27-alpine` → `alpine:3.20`), `CGO_ENABLED=0`, binary only in the final image, `HEALTHCHECK` on `/health`. |
+| [.env.example](.env.example) | Every environment variable with fake values. `.env` itself is gitignored. |
+| [.github/workflows/ci.yml](.github/workflows/ci.yml) | gofmt, vet, `go test -race`, the contract build, and a Docker build on every push and PR. |
 | [go.mod](go.mod) / [go.sum](go.sum) | Module `github.com/roy-herzlichkeit/shortened`, Go 1.24, with the four AWS SDK modules and their transitive versions pinned and hashed. Only the SDK plus the standard library is used. |
 
 ## Request flow
@@ -20,11 +22,14 @@ Upload: the browser asks the API for permission to upload
 ```
 browser  --POST /upload-url {filename,size} + X-API-Key-->  API
 API: size <= 50 MB? -> clean filename -> key = <16 hex>-<name>
-     sign PutObject for that key, 10 minute expiry
+     sign PutObject for that key and that exact Content-Length, 10 minute expiry
 API  --{"key","url"}-->  browser
 browser  --PUT file bytes------>  B2 (presigned URL, no key, no API in the path)
-browser  --GET /files---------->  API --> ListObjectsV2 --> bucket listing
+browser  --GET /files---------->  API --> ListObjectsV2 --> listing, newest first
 ```
+
+Delete: `DELETE /files?key=...` with the API key; the API calls DeleteObject and
+answers `204`.
 
 Download: the browser asks for a link, then leaves for the bucket
 
@@ -68,9 +73,30 @@ as a directory traversal or a name that breaks URL escaping. `cleanFilename`
 strips directory parts, collapses anything outside `[A-Za-z0-9._-]`, trims
 leading dots and separators, and caps the length while keeping the extension.
 
+**Keys are validated by shape, not by substring.** `/download-url` and
+`DELETE /files` accept only `^[0-9a-f]{16}-[A-Za-z0-9._-]{1,120}$`, the exact
+shape the upload handler issues. An earlier `..` substring check wrongly rejected
+legitimate names such as `my..file.txt` (S3 keys are flat, so `..` means nothing
+there). A test asserts that every issued key passes validation.
+
+**The upload size is signed.** The client declares `size`, and the API puts it
+into the presigned PUT as `Content-Length`, so `content-length` appears in
+`X-Amz-SignedHeaders`. A PUT whose body differs from the declared size fails the
+signature check, which makes the 50 MB limit binding. The browser sets
+`Content-Length` itself from the file, so the page needs no extra work.
+
+**Downloads are attachments.** Presigned GETs carry
+`response-content-disposition=attachment; filename="<name>"`. An uploaded HTML
+or SVG file is therefore saved, not rendered on the bucket's origin, and it is
+saved under its cleaned name without the random prefix. `/files` also returns
+that `name` next to the `key`.
+
 **`path-style` signer for both directions, 10 minute expiry.** The expiry is
 short because the link is the credential: it is the only thing an attacker could
 reuse, and both the PUT and the GET expire on their own.
+
+**Graceful shutdown.** SIGINT and SIGTERM stop the listener and give in-flight
+requests 10 seconds to finish, so `docker stop` doesn't cut responses off.
 
 **API key in a custom header.** `X-API-Key` compared with
 `crypto/subtle.ConstantTimeCompare`, so the check does not leak the key through
@@ -86,7 +112,15 @@ deliberately outside it.
 **Bare JSON array for `/files`.** The contract spells out the wrapper object
 for `/upload-url` and `/download-url` but describes `/files` only as "a list of
 `{"key","size","lastModified"}`", so the response is that list itself, with
-`lastModified` in RFC 3339 and `size` in bytes.
+`lastModified` in RFC 3339 and `size` in bytes. Each entry also has an additive
+`name` field, and the list is sorted newest first. The listing is not capped:
+the bucket is the only index, so a cap would hide arbitrary files. A bucket big
+enough for that to matter needs a real index.
+
+**Known limits, accepted for now.** The access model is one shared API key: no
+per-user identity, no per-key revocation, no rate limiting. Anyone holding the
+key can list, download and delete everything. Changing that needs real
+authentication, which is a design decision, not a bug fix.
 
 **Standard library only besides the SDK.** `net/http` with a `ServeMux`,
 `encoding/json`, `crypto/rand`. No framework, no database, no background
@@ -111,11 +145,13 @@ CGO_ENABLED=0 GOOS=linux go build -o server ./api
 ```
 
 The page is static, so it is served separately — `python -m http.server` in
-`web/` is enough for local use. Two things must line up with it: set `API_URL`
-at the top of the page's script to the API address, and put the page's exact
-origin in `ALLOWED_ORIGIN`. The bucket also needs a CORS rule allowing `PUT`
-and `GET` from that origin, because the upload and download requests go straight
-to B2 and not through the API.
+`web/` is enough for local use. Two things must line up with it: set the
+`api-url` meta tag in the page's `<head>` to the API address, and put the page's
+exact origin in `ALLOWED_ORIGIN`. The API address is deliberately not read from
+the query string, because a crafted link could then send the typed API key to
+another server. The bucket also needs a CORS rule allowing `PUT` (with the
+`Content-Type` header) and `GET` from that origin, because the upload and
+download requests go straight to B2 and not through the API.
 
 ## Checks run, and what was not
 
@@ -131,8 +167,27 @@ missing and traversal `key` values return `400`; and a valid `/upload-url` call
 returns a path-style presigned PUT on the configured endpoint with
 `X-Amz-Expires=600` and only `host` signed.
 
-Not run: nothing has ever spoken to a real bucket — no upload, download,
-listing or signed link was exercised, and the page was never opened in a
-browser. So B2's acceptance of the presigned URLs and checksum handling, the
-required bucket CORS rules, and the key's permissions are all unconfirmed.
-There are also no automated tests.
+Automated tests (`go test ./...`, also run by CI) cover:
+- filename cleaning;
+- that every issued key passes key validation, and that malformed keys fail it;
+- auth and CORS on every protected route;
+- upload signing: path style, a 600 s expiry, and `content-length` signed (a
+  mutation check confirmed this test fails when the length is not signed);
+- upload rejections (400/413/405);
+- the download link's `attachment` disposition;
+- listing order and delete, both against an in-process fake S3 endpoint.
+
+On 2026-10-30, on Go 1.27.3/windows: `gofmt -l api` was empty, `go vet ./...`
+was clean, all tests passed, `go mod tidy` left `go.mod`/`go.sum` unchanged,
+the contract's linux build succeeded, and the page's script passed
+`node --check`.
+
+Not run: the Docker image was not rebuilt after the `HEALTHCHECK` change
+(Docker was unavailable), and `go test -race` has only been configured for CI,
+not run. Nothing has ever spoken to a real bucket, and the page has never been
+opened in a browser. Still unconfirmed:
+- whether B2 accepts the presigned URLs, including the signed
+  `content-length` and `response-content-disposition`;
+- the checksum handling;
+- the required bucket CORS rules;
+- the key's delete permission.

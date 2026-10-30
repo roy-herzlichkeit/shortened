@@ -15,9 +15,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -31,6 +34,7 @@ const (
 	linkTTL       = 10 * time.Minute
 	maxNameLen    = 120
 	maxBodyBytes  = 8 << 10
+	idLen         = 16 // hex characters in the random key prefix
 )
 
 type config struct {
@@ -82,19 +86,13 @@ type server struct {
 	presign *s3.PresignClient
 }
 
-func main() {
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatalf("config: %v", err)
-	}
-
-	ctx := context.Background()
+func newServer(ctx context.Context, cfg config) (*server, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(cfg.region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.keyID, cfg.appKey, "")),
 	)
 	if err != nil {
-		log.Fatalf("aws config: %v", err)
+		return nil, err
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
@@ -112,26 +110,59 @@ func main() {
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 
-	s := &server{cfg: cfg, client: client, presign: s3.NewPresignClient(client)}
+	return &server{cfg: cfg, client: client, presign: s3.NewPresignClient(client)}, nil
+}
 
+func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.Handle("/upload-url", s.protect(s.handleUploadURL))
 	mux.Handle("/files", s.protect(s.handleFiles))
 	mux.Handle("/download-url", s.protect(s.handleDownloadURL))
+	return mux
+}
+
+func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	s, err := newServer(ctx, cfg)
+	if err != nil {
+		log.Fatalf("aws config: %v", err)
+	}
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.port,
-		Handler:           mux,
+		Handler:           s.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("listening on :%s (bucket %q, allowed origin %q)", cfg.port, cfg.bucket, cfg.origin)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Printf("listening on :%s (bucket %q, allowed origin %q)", cfg.port, cfg.bucket, cfg.origin)
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
 		log.Fatalf("server: %v", err)
+	case <-ctx.Done():
+	}
+
+	// Let in-flight signing requests finish before the container stops.
+	log.Printf("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
 	}
 }
 
@@ -143,7 +174,7 @@ func (s *server) protect(next http.HandlerFunc) http.Handler {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", s.cfg.origin)
 		h.Set("Vary", "Origin")
-		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		h.Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key")
 		h.Set("Access-Control-Max-Age", "600")
 
@@ -217,11 +248,14 @@ func (s *server) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 	}
 	key := id + "-" + name
 
-	// The PUT policy is bound to the key and expires in 10 minutes, so the
-	// browser can upload exactly one object and only until the link goes stale.
+	// The PUT signature covers the key and the declared Content-Length and
+	// expires in 10 minutes, so the browser can upload exactly one object of
+	// exactly the size it asked for, and only until the link goes stale. Signing
+	// the length is what makes the 50 MB limit binding rather than advisory.
 	signed, err := s.presign.PresignPutObject(r.Context(), &s3.PutObjectInput{
-		Bucket: aws.String(s.cfg.bucket),
-		Key:    aws.String(key),
+		Bucket:        aws.String(s.cfg.bucket),
+		Key:           aws.String(key),
+		ContentLength: aws.Int64(req.Size),
 	}, s3.WithPresignExpires(linkTTL))
 	if err != nil {
 		log.Printf("presign put %q: %v", key, err)
@@ -234,18 +268,33 @@ func (s *server) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 
 type fileInfo struct {
 	Key          string `json:"key"`
+	Name         string `json:"name"`
 	Size         int64  `json:"size"`
 	LastModified string `json:"lastModified"`
 }
 
 func (s *server) handleFiles(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", "GET, OPTIONS")
-		writeError(w, http.StatusMethodNotAllowed, "use GET")
-		return
+	switch r.Method {
+	case http.MethodGet:
+		s.listFiles(w, r)
+	case http.MethodDelete:
+		s.deleteFile(w, r)
+	default:
+		w.Header().Set("Allow", "GET, DELETE, OPTIONS")
+		writeError(w, http.StatusMethodNotAllowed, "use GET or DELETE")
 	}
+}
 
-	files := []fileInfo{}
+// listFiles returns every object in the bucket, newest first. The listing is
+// unbounded because the bucket is the only record of what exists; a bucket
+// large enough to make that slow needs a real index, not a cap here.
+func (s *server) listFiles(w http.ResponseWriter, r *http.Request) {
+	type object struct {
+		info     fileInfo
+		modified time.Time
+	}
+	var objects []object
+
 	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.cfg.bucket),
 	})
@@ -257,15 +306,44 @@ func (s *server) handleFiles(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, obj := range page.Contents {
-			info := fileInfo{Key: aws.ToString(obj.Key), Size: aws.ToInt64(obj.Size)}
+			key := aws.ToString(obj.Key)
+			o := object{info: fileInfo{Key: key, Name: displayName(key), Size: aws.ToInt64(obj.Size)}}
 			if obj.LastModified != nil {
-				info.LastModified = obj.LastModified.UTC().Format(time.RFC3339)
+				o.modified = obj.LastModified.UTC()
+				o.info.LastModified = o.modified.Format(time.RFC3339)
 			}
-			files = append(files, info)
+			objects = append(objects, o)
 		}
 	}
 
+	slices.SortStableFunc(objects, func(a, b object) int {
+		return b.modified.Compare(a.modified)
+	})
+	files := make([]fileInfo, 0, len(objects))
+	for _, o := range objects {
+		files = append(files, o.info)
+	}
+
 	writeJSON(w, http.StatusOK, files)
+}
+
+func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
+	key, ok := keyParam(w, r)
+	if !ok {
+		return
+	}
+
+	_, err := s.client.DeleteObject(r.Context(), &s3.DeleteObjectInput{
+		Bucket: aws.String(s.cfg.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		log.Printf("delete %q: %v", key, err)
+		writeError(w, http.StatusBadGateway, "could not delete the file")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *server) handleDownloadURL(w http.ResponseWriter, r *http.Request) {
@@ -275,19 +353,18 @@ func (s *server) handleDownloadURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := r.URL.Query().Get("key")
-	if key == "" {
-		writeError(w, http.StatusBadRequest, "missing key query parameter")
-		return
-	}
-	if strings.HasPrefix(key, "/") || strings.Contains(key, "..") {
-		writeError(w, http.StatusBadRequest, "invalid key")
+	key, ok := keyParam(w, r)
+	if !ok {
 		return
 	}
 
+	// Forcing an attachment keeps an uploaded HTML or SVG file from rendering
+	// in the browser on the bucket's origin. The name is already restricted to
+	// [A-Za-z0-9._-], so it needs no quoting beyond the surrounding quotes.
 	signed, err := s.presign.PresignGetObject(r.Context(), &s3.GetObjectInput{
-		Bucket: aws.String(s.cfg.bucket),
-		Key:    aws.String(key),
+		Bucket:                     aws.String(s.cfg.bucket),
+		Key:                        aws.String(key),
+		ResponseContentDisposition: aws.String(`attachment; filename="` + displayName(key) + `"`),
 	}, s3.WithPresignExpires(linkTTL))
 	if err != nil {
 		log.Printf("presign get %q: %v", key, err)
@@ -298,7 +375,40 @@ func (s *server) handleDownloadURL(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"url": signed.URL})
 }
 
-var unsafeNameChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+// keyParam reads the "key" query parameter and writes a 400 unless it has the
+// exact shape handleUploadURL produces.
+func keyParam(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing key query parameter")
+		return "", false
+	}
+	if !validKey(key) {
+		writeError(w, http.StatusBadRequest, "invalid key")
+		return "", false
+	}
+	return key, true
+}
+
+var (
+	unsafeNameChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+	keyPattern      = regexp.MustCompile(`^[0-9a-f]{16}-[A-Za-z0-9._-]{1,120}$`)
+)
+
+// validKey reports whether key looks like one this API issued: a random hex
+// prefix and a name that cleanFilename could have produced.
+func validKey(key string) bool {
+	return keyPattern.MatchString(key)
+}
+
+// displayName strips the random prefix from a key, giving back the cleaned
+// filename the uploader chose. Keys of any other shape are returned unchanged.
+func displayName(key string) string {
+	if validKey(key) {
+		return key[idLen+1:]
+	}
+	return key
+}
 
 // cleanFilename turns a client-supplied name into a flat, harmless object-key
 // suffix: no directories, no control characters, no characters that would need
@@ -324,7 +434,7 @@ func cleanFilename(name string) string {
 }
 
 func newID() (string, error) {
-	buf := make([]byte, 8)
+	buf := make([]byte, idLen/2)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
