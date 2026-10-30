@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+# The tests use 0123456789abcdef as a made-up object-key prefix, which the
+# generic-api-key rule mistakes for a credential.
+[allowlist]
+description = "Fake object keys in tests"
+regexes = ['''0123456789abcdef''']
