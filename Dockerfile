@@ -14,6 +14,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server 
 # Final stage: no Go toolchain and no package tooling, just the binary and the
 # CA bundle it needs to reach B2 over TLS.
 FROM alpine:3.20
+# Unpinned on purpose: the newest CA bundle is the one we want, and pinned apk
+# versions break whenever Alpine drops the old package from its index.
+# hadolint ignore=DL3018
 RUN apk add --no-cache ca-certificates \
     && adduser -D -H -u 10001 app
 COPY --from=build /out/server /server

@@ -4,22 +4,189 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.27"
 
 jobs:
-  check:
+  go:
+    name: Go (format, vet, lint, test, build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.27"
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Modules match go.sum
+        run: go mod verify
+
       - name: gofmt
-        run: test -z "$(gofmt -l api)" || (gofmt -l api && exit 1)
-      - name: vet
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
         run: go vet ./...
-      - name: test
-        run: go test -race ./...
-      - name: build
-        run: CGO_ENABLED=0 GOOS=linux go build -o server ./api
-      - name: docker build
-        run: docker build -t shortened-api .
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: gosec
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.30.0 -quiet ./...
+
+      - name: Tests (race detector, coverage)
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Contract build (static linux binary)
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build -o server ./api
+          file server | grep -q 'statically linked'
+
+  vulns:
+    name: Go vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  docker:
+    name: Docker (lint, build, smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Build image
+        run: docker build -t shortened-api:ci .
+
+      # Fake credentials are enough: presigning is local, and nothing here
+      # lists or deletes, so the container never has to reach B2.
+      - name: Start container
+        run: |
+          docker run -d --name api -p 8080:8080 \
+            -e B2_KEY_ID=0000000000000000000000001 \
+            -e B2_APP_KEY=K0000000000000000000000000000000 \
+            -e B2_ENDPOINT=https://s3.us-west-004.backblazeb2.com \
+            -e B2_REGION=us-west-004 \
+            -e B2_BUCKET=ci-bucket \
+            -e API_KEY=ci-api-key \
+            -e ALLOWED_ORIGIN=http://localhost:8000 \
+            shortened-api:ci
+
+      - name: HEALTHCHECK reports healthy
+        run: |
+          for _ in $(seq 1 40); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' api)"
+            [ "$status" = healthy ] && exit 0
+            sleep 2
+          done
+          echo "container health is '$status'"; docker logs api; exit 1
+
+      - name: Runs as a non-root user
+        run: test "$(docker inspect -f '{{.Config.User}}' api)" = app
+
+      - name: HTTP smoke test
+        run: |
+          set -eu
+          base=http://127.0.0.1:8080
+          expect() { # expect <status> <curl args...>
+            want="$1"; shift
+            got="$(curl -s -o /tmp/body -w '%{http_code}' "$@")"
+            if [ "$got" != "$want" ]; then
+              echo "want $want, got $got for: $*"; cat /tmp/body; exit 1
+            fi
+          }
+
+          expect 200 "$base/health"
+          expect 401 "$base/files"
+          expect 401 -H 'X-API-Key: wrong' "$base/files"
+          expect 204 -X OPTIONS "$base/upload-url"
+          expect 413 -H 'X-API-Key: ci-api-key' -d '{"filename":"a.bin","size":52428801}' "$base/upload-url"
+          expect 400 -H 'X-API-Key: ci-api-key' "$base/download-url?key=..%2Fsecret"
+
+          expect 200 -H 'X-API-Key: ci-api-key' -d '{"filename":"my..file.txt","size":12}' "$base/upload-url"
+          grep -q 'content-length' /tmp/body || { echo "upload URL does not sign content-length"; cat /tmp/body; exit 1; }
+
+          expect 200 -H 'X-API-Key: ci-api-key' "$base/download-url?key=0123456789abcdef-my..file.txt"
+          grep -q 'response-content-disposition=attachment' /tmp/body || { echo "download URL is not an attachment"; cat /tmp/body; exit 1; }
+
+      - name: Stops gracefully on SIGTERM
+        run: |
+          docker stop -t 15 api
+          docker logs api 2>&1 | grep -q 'shutting down'
+          test "$(docker inspect -f '{{.State.ExitCode}}' api)" = 0
+
+      - name: Container logs
+        if: failure()
+        run: docker logs api || true
+
+  web:
+    name: Web page (HTML, JS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: html-validate
+        run: npx --yes html-validate@9.7.1 web/index.html
+
+      - name: Inline script parses
+        run: |
+          node -e '
+            const html = require("fs").readFileSync("web/index.html", "utf8");
+            const m = html.match(/<script>([\s\S]*?)<\/script>/);
+            if (!m) { console.error("no inline <script> found"); process.exit(1); }
+            new Function(m[1]); // parses without running it
+          '
+
+      - name: API address is not taken from the URL
+        run: |
+          if grep -nE 'location\.(search|hash)|URLSearchParams' web/index.html; then
+            echo "The page must not read the API address from the URL: a crafted link could leak the API key."
+            exit 1
+          fi
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No .env files committed
+        run: |
+          found="$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$' || true)"
+          if [ -n "$found" ]; then echo "Committed env files:"; echo "$found"; exit 1; fi

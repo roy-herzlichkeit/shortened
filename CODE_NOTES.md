@@ -12,7 +12,10 @@ bucket that holds the bytes, and one HTML page that talks to both.
 | [web/index.html](web/index.html) | The whole UI: API key field, file picker with upload progress, file list with Download and Delete buttons. Plain HTML + JS, no build step. |
 | [Dockerfile](Dockerfile) | Multi-stage build (`golang:1.27-alpine` → `alpine:3.20`), `CGO_ENABLED=0`, binary only in the final image, `HEALTHCHECK` on `/health`. |
 | [.env.example](.env.example) | Every environment variable with fake values. `.env` itself is gitignored. |
-| [.github/workflows/ci.yml](.github/workflows/ci.yml) | gofmt, vet, `go test -race`, the contract build, and a Docker build on every push and PR. |
+| [.github/workflows/ci.yml](.github/workflows/ci.yml) | Runs on every push to `main` and every PR. Five jobs: **Go** (tidy and `mod verify`, gofmt, vet, staticcheck, gosec, `go test -race` with coverage, static linux build); **vulns** (govulncheck); **docker** (hadolint, image build, HEALTHCHECK must turn healthy, non-root user, HTTP smoke test of status codes and signed URLs, clean exit on SIGTERM); **web** (html-validate, the inline script parses, the API address is not read from the URL); **secrets** (gitleaks over full history, no committed `.env`). |
+| [.github/workflows/codeql.yml](.github/workflows/codeql.yml) | CodeQL `security-and-quality` for Go and the page's JavaScript, on push, PR and weekly. |
+| [.github/dependabot.yml](.github/dependabot.yml) | Weekly update PRs for Go modules (AWS SDK grouped), the Docker base images, and the Actions used. |
+| [.htmlvalidate.json](.htmlvalidate.json) / [.gitleaks.toml](.gitleaks.toml) | Linter configs. Each turns off one false positive (lowercase doctype; the fake key prefix in tests), with the reason in the file. |
 | [go.mod](go.mod) / [go.sum](go.sum) | Module `github.com/roy-herzlichkeit/shortened`, Go 1.24, with the four AWS SDK modules and their transitive versions pinned and hashed. Only the SDK plus the standard library is used. |
 
 ## Request flow
