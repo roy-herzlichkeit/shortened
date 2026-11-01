@@ -2,9 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -61,6 +70,7 @@ type reqOpt func(*http.Request)
 func withCookie(c *http.Cookie) reqOpt { return func(r *http.Request) { r.AddCookie(c) } }
 func withOrigin(o string) reqOpt       { return func(r *http.Request) { r.Header.Set("Origin", o) } }
 func withRemoteAddr(a string) reqOpt   { return func(r *http.Request) { r.RemoteAddr = a } }
+func withHost(h string) reqOpt         { return func(r *http.Request) { r.Host = h } }
 
 func do(t *testing.T, h http.Handler, method, target, body string, opts ...reqOpt) *httptest.ResponseRecorder {
 	t.Helper()
@@ -302,6 +312,42 @@ func TestCrossOriginRefused(t *testing.T) {
 	if rec := do(t, h, http.MethodPost, "/auth/login", creds("alice", "correct horse battery"),
 		withOrigin("http://example.com")); rec.Code != http.StatusOK {
 		t.Errorf("same-origin login: status %d, want 200", rec.Code)
+	}
+}
+
+// Behind CloudFront, with the viewer's Host forwarded, Origin and Host name
+// the public domain (or the distribution's own name) and must match.
+func TestSameOriginBehindCDN(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint))
+	signup(t, h, "alice")
+	login := creds("alice", "correct horse battery")
+
+	for _, tt := range []struct {
+		origin, host string
+		want         int
+	}{
+		{"https://herzlichkeit-zero.click", "herzlichkeit-zero.click", http.StatusOK},
+		{"https://d111111abcdef8.cloudfront.net", "d111111abcdef8.cloudfront.net", http.StatusOK},
+		{"https://herzlichkeit-zero.click", "d111111abcdef8.cloudfront.net", http.StatusForbidden},
+		{"https://d111111abcdef8.cloudfront.net", "herzlichkeit-zero.click", http.StatusForbidden},
+		{"https://evil.example", "herzlichkeit-zero.click", http.StatusForbidden},
+		// www and the apex are different hosts; www must redirect to the apex.
+		{"https://www.herzlichkeit-zero.click", "herzlichkeit-zero.click", http.StatusForbidden},
+	} {
+		rec := do(t, h, http.MethodPost, "/auth/login", login, withOrigin(tt.origin), withHost(tt.host))
+		if rec.Code != tt.want {
+			t.Errorf("Origin %s, Host %s: status %d, want %d", tt.origin, tt.host, rec.Code, tt.want)
+		}
+	}
+}
+
+func TestSessionCookieFlags(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint)) // cookieSecure: true, the default
+	rec := do(t, h, http.MethodPost, "/auth/signup", creds("alice", "correct horse battery"))
+	c := sessionFrom(t, rec)
+	if !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" {
+		t.Errorf("session cookie: Secure %v, HttpOnly %v, SameSite %v, Path %q; want Secure, HttpOnly, Lax, /",
+			c.Secure, c.HttpOnly, c.SameSite, c.Path)
 	}
 }
 
@@ -795,10 +841,147 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestAPINoStore(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint))
+	c := signup(t, h, "alice")
+
+	for _, tt := range []struct {
+		method, target, body string
+		opts                 []reqOpt
+	}{
+		{http.MethodGet, "/health", "", nil},
+		{http.MethodPost, "/auth/signup", creds("bob", "correct horse battery"), nil},
+		{http.MethodPost, "/auth/login", creds("alice", "correct horse battery"), nil},
+		{http.MethodGet, "/auth/me", "", []reqOpt{withCookie(c)}},
+		{http.MethodGet, "/auth/me", "", nil}, // 401, errors too
+		{http.MethodPost, "/upload-url", `{"filename":"a.txt","size":1}`, []reqOpt{withCookie(c)}},
+		{http.MethodGet, "/download-url?key=nope", "", []reqOpt{withCookie(c)}},
+		{http.MethodGet, "/files", "", nil},
+		{http.MethodPost, "/auth/logout", "", []reqOpt{withCookie(c)}},
+	} {
+		rec := do(t, h, tt.method, tt.target, tt.body, tt.opts...)
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("%s %s (status %d): Cache-Control = %q, want no-store", tt.method, tt.target, rec.Code, got)
+		}
+	}
+
+	// The page stays cacheable-with-revalidation; it holds nothing per user.
+	if got := do(t, h, http.MethodGet, "/", "").Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("GET /: Cache-Control = %q, want no-cache", got)
+	}
+}
+
+// selfSignedCert writes a throwaway certificate for 127.0.0.1 into a temp dir
+// and returns the PEM file paths plus a pool that trusts it. Nothing is kept.
+func selfSignedCert(t *testing.T) (certFile, keyFile string, pool *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certFile, keyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool = x509.NewCertPool()
+	pool.AddCert(cert)
+	return certFile, keyFile, pool
+}
+
+// startServer runs the real serve path on a random local port.
+func startServer(t *testing.T, cfg config) string {
+	t.Helper()
+	_, h := newTestServer(t, cfg)
+	srv := newHTTPServer(cfg, h)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = serve(srv, ln, cfg) }()
+	t.Cleanup(func() { srv.Close() })
+	return ln.Addr().String()
+}
+
+func TestServeTLS(t *testing.T) {
+	cfg := testConfig(testEndpoint)
+	certFile, keyFile, pool := selfSignedCert(t)
+	cfg.tlsCert, cfg.tlsKey = certFile, keyFile
+	addr := startServer(t, cfg)
+
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+	}}
+	resp, err := client.Get("https://" + addr + "/health")
+	if err != nil {
+		t.Fatalf("HTTPS /health: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.TLS == nil || resp.TLS.Version < tls.VersionTLS12 {
+		t.Errorf("HTTPS /health: status %d, TLS %+v; want 200 over TLS 1.2+", resp.StatusCode, resp.TLS)
+	}
+
+	// TLS 1.1 is refused.
+	old := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS11}, // #nosec G402 -- checking that the server refuses it
+	}}
+	if resp, err := old.Get("https://" + addr + "/health"); err == nil {
+		resp.Body.Close()
+		t.Error("TLS 1.1 client: request succeeded, want a handshake failure")
+	} else if !strings.Contains(err.Error(), "protocol version") {
+		t.Errorf("TLS 1.1 client: error %v, want a protocol version failure", err)
+	}
+
+	// Plain HTTP to the HTTPS port gets no real answer.
+	if resp, err := http.Get("http://" + addr + "/health"); err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Error("plain HTTP to the HTTPS port: status 200")
+		}
+	}
+}
+
+func TestServePlainHTTP(t *testing.T) {
+	addr := startServer(t, testConfig(testEndpoint))
+	resp, err := http.Get("http://" + addr + "/health")
+	if err != nil {
+		t.Fatalf("HTTP /health: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.TLS != nil {
+		t.Errorf("HTTP /health: status %d, TLS %v; want 200 without TLS", resp.StatusCode, resp.TLS)
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	set := func(env map[string]string) {
 		for _, k := range []string{"B2_KEY_ID", "B2_APP_KEY", "B2_ENDPOINT", "B2_REGION", "B2_BUCKET",
-			"PORT", "DB_PATH", "QUOTA_MB", "MAX_USERS", "COOKIE_SECURE", "TRUST_PROXY"} {
+			"PORT", "DB_PATH", "QUOTA_MB", "MAX_USERS", "COOKIE_SECURE", "TRUST_PROXY",
+			"TLS_CERT_FILE", "TLS_KEY_FILE"} {
 			t.Setenv(k, env[k])
 		}
 	}
@@ -813,15 +996,26 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.port != "8080" || cfg.dbPath != "shortened.db" || cfg.quotaBytes != 500<<20 ||
-		cfg.maxUsers != 0 || !cfg.cookieSecure || cfg.trustProxy {
+		cfg.maxUsers != 0 || !cfg.cookieSecure || cfg.trustProxy || cfg.tlsCert != "" || cfg.tlsKey != "" {
 		t.Errorf("defaults = %+v", cfg)
 	}
 
+	withTLS := map[string]string{"TLS_CERT_FILE": "/certs/cert.pem", "TLS_KEY_FILE": "/certs/key.pem"}
+	for k, v := range base {
+		withTLS[k] = v
+	}
+	set(withTLS)
+	if cfg, err := loadConfig(); err != nil || cfg.tlsCert != "/certs/cert.pem" || cfg.tlsKey != "/certs/key.pem" {
+		t.Errorf("both TLS files: cfg %+v, err %v", cfg, err)
+	}
+
 	for name, override := range map[string][2]string{
-		"missing bucket": {"B2_BUCKET", ""},
-		"zero quota":     {"QUOTA_MB", "0"},
-		"text quota":     {"QUOTA_MB", "lots"},
-		"negative users": {"MAX_USERS", "-1"},
+		"missing bucket":   {"B2_BUCKET", ""},
+		"zero quota":       {"QUOTA_MB", "0"},
+		"text quota":       {"QUOTA_MB", "lots"},
+		"negative users":   {"MAX_USERS", "-1"},
+		"cert without key": {"TLS_CERT_FILE", "/certs/cert.pem"},
+		"key without cert": {"TLS_KEY_FILE", "/certs/key.pem"},
 	} {
 		env := map[string]string{}
 		for k, v := range base {

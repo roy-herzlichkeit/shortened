@@ -9,10 +9,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,6 +52,8 @@ type config struct {
 	maxUsers     int
 	cookieSecure bool
 	trustProxy   bool
+	tlsCert      string // PEM file; with tlsKey, the server speaks HTTPS
+	tlsKey       string
 }
 
 func loadConfig() (config, error) {
@@ -63,6 +67,13 @@ func loadConfig() (config, error) {
 		dbPath:       envOr("DB_PATH", "shortened.db"),
 		cookieSecure: os.Getenv("COOKIE_SECURE") != "false",
 		trustProxy:   os.Getenv("TRUST_PROXY") == "true",
+		tlsCert:      os.Getenv("TLS_CERT_FILE"),
+		tlsKey:       os.Getenv("TLS_KEY_FILE"),
+	}
+
+	// One without the other is a broken deploy, not a request for plain HTTP.
+	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
+		return config{}, errors.New("set both TLS_CERT_FILE and TLS_KEY_FILE for HTTPS, or neither for plain HTTP")
 	}
 
 	required := []struct{ name, value string }{
@@ -143,19 +154,30 @@ func newServer(ctx context.Context, cfg config, db *sql.DB) (*server, error) {
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
+	mux.Handle("/health", noStore(http.HandlerFunc(s.handleHealth)))
 
-	mux.Handle("/auth/signup", s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleSignup))))
-	mux.Handle("/auth/login", s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleLogin))))
-	mux.Handle("/auth/logout", s.sameOrigin(http.HandlerFunc(s.handleLogout)))
-	mux.Handle("/auth/me", s.requireUser(s.handleMe))
+	mux.Handle("/auth/signup", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleSignup)))))
+	mux.Handle("/auth/login", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleLogin)))))
+	mux.Handle("/auth/logout", noStore(s.sameOrigin(http.HandlerFunc(s.handleLogout))))
+	mux.Handle("/auth/me", noStore(s.requireUser(s.handleMe)))
 
-	mux.Handle("/upload-url", s.requireUser(s.handleUploadURL))
-	mux.Handle("/files", s.requireUser(s.handleFiles))
-	mux.Handle("/download-url", s.requireUser(s.handleDownloadURL))
+	mux.Handle("/upload-url", noStore(s.requireUser(s.handleUploadURL)))
+	mux.Handle("/files", noStore(s.requireUser(s.handleFiles)))
+	mux.Handle("/download-url", noStore(s.requireUser(s.handleDownloadURL)))
 
 	mux.Handle("/", s.pageHandler())
 	return mux
+}
+
+// noStore marks a response as never cacheable. API answers are per user (file
+// lists, signed links, the session cookie), so a shared cache such as a CDN
+// must never keep one and hand it to someone else. It is set before the
+// handler runs, so error responses carry it too.
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // pageHandler serves the embedded web page. The page and the API share an
@@ -220,20 +242,21 @@ func main() {
 		log.Fatalf("aws config: %v", err)
 	}
 
-	srv := &http.Server{
-		Addr:              ":" + cfg.port,
-		Handler:           s.routes(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       60 * time.Second,
+	srv := newHTTPServer(cfg, s.routes())
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
 	}
 
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Printf("listening on :%s (bucket %q, database %q, quota %d MB)",
-			cfg.port, cfg.bucket, cfg.dbPath, cfg.quotaBytes>>20)
-		serveErr <- srv.ListenAndServe()
+		scheme := "http"
+		if cfg.tlsCert != "" {
+			scheme = "https"
+		}
+		log.Printf("listening on :%s, %s (bucket %q, database %q, quota %d MB)",
+			cfg.port, scheme, cfg.bucket, cfg.dbPath, cfg.quotaBytes>>20)
+		serveErr <- serve(srv, ln, cfg)
 	}()
 
 	select {
@@ -249,6 +272,28 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+}
+
+func newHTTPServer(cfg config, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              ":" + cfg.port,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		// Only used in HTTPS mode. TLS 1.0 and 1.1 are deprecated (RFC 8996).
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+}
+
+// serve runs srv on ln: HTTPS when a certificate is configured, which lets a
+// CDN reach the origin encrypted, and plain HTTP otherwise, as for local use.
+func serve(srv *http.Server, ln net.Listener, cfg config) error {
+	if cfg.tlsCert != "" {
+		return srv.ServeTLS(ln, cfg.tlsCert, cfg.tlsKey)
+	}
+	return srv.Serve(ln)
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {

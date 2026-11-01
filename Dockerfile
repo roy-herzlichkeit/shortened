@@ -32,7 +32,14 @@ VOLUME /data
 
 USER app
 EXPOSE 8080
-# busybox wget ships with alpine; /health needs no session.
+# busybox wget ships with alpine; /health needs no session. In HTTPS mode
+# (TLS_CERT_FILE set) the certificate names the public domain, not
+# 127.0.0.1, so the check skips verification; it only ever talks to the
+# loopback address inside this container.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-8080}/health" || exit 1
+    CMD if [ -n "$TLS_CERT_FILE" ]; then \
+          wget -q --no-check-certificate -O /dev/null "https://127.0.0.1:${PORT:-8080}/health"; \
+        else \
+          wget -q -O /dev/null "http://127.0.0.1:${PORT:-8080}/health"; \
+        fi || exit 1
 ENTRYPOINT ["/server"]
