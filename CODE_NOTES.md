@@ -142,6 +142,13 @@ no-caching policy (CloudFront: `CachingDisabled`), since a policy with a
 minimum TTL above zero overrides the header. The page itself keeps
 `no-cache`, as it holds nothing per user.
 
+**Optional HTTPS on the server.** With `TLS_CERT_FILE` and `TLS_KEY_FILE`
+set, the server speaks HTTPS on `PORT`, TLS 1.2 or newer. That lets a CDN
+reach the origin encrypted without a separate proxy. A proxy in front would
+append its own address to `X-Forwarded-For` and break the `TRUST_PROXY`
+rule above. The files are read once at start-up, so restart the server after
+renewing the certificate. With neither set, it's plain HTTP, as for local use.
+
 **The look.** The design is a neon-noir theme: hard yellow `#fcee0a` on
 near-black, cyan and red accents, cut-corner panels and buttons, Rajdhani and
 Share Tech Mono from Google Fonts, scanlines and a glitch title. It's inspired
@@ -178,6 +185,8 @@ Optional, with defaults:
 - `MAX_USERS` = `0`, meaning no limit
 - `COOKIE_SECURE` = `true`
 - `TRUST_PROXY` = `false`
+- `TLS_CERT_FILE`, `TLS_KEY_FILE` = empty, meaning plain HTTP. Set both to
+  serve HTTPS; setting only one stops the server at start-up.
 
 See `.env.example` for what each one does.
 

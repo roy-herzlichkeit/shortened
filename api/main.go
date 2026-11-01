@@ -9,10 +9,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,6 +52,8 @@ type config struct {
 	maxUsers     int
 	cookieSecure bool
 	trustProxy   bool
+	tlsCert      string // PEM file; with tlsKey, the server speaks HTTPS
+	tlsKey       string
 }
 
 func loadConfig() (config, error) {
@@ -63,6 +67,13 @@ func loadConfig() (config, error) {
 		dbPath:       envOr("DB_PATH", "shortened.db"),
 		cookieSecure: os.Getenv("COOKIE_SECURE") != "false",
 		trustProxy:   os.Getenv("TRUST_PROXY") == "true",
+		tlsCert:      os.Getenv("TLS_CERT_FILE"),
+		tlsKey:       os.Getenv("TLS_KEY_FILE"),
+	}
+
+	// One without the other is a broken deploy, not a request for plain HTTP.
+	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
+		return config{}, errors.New("set both TLS_CERT_FILE and TLS_KEY_FILE for HTTPS, or neither for plain HTTP")
 	}
 
 	required := []struct{ name, value string }{
@@ -231,20 +242,21 @@ func main() {
 		log.Fatalf("aws config: %v", err)
 	}
 
-	srv := &http.Server{
-		Addr:              ":" + cfg.port,
-		Handler:           s.routes(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       60 * time.Second,
+	srv := newHTTPServer(cfg, s.routes())
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
 	}
 
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Printf("listening on :%s (bucket %q, database %q, quota %d MB)",
-			cfg.port, cfg.bucket, cfg.dbPath, cfg.quotaBytes>>20)
-		serveErr <- srv.ListenAndServe()
+		scheme := "http"
+		if cfg.tlsCert != "" {
+			scheme = "https"
+		}
+		log.Printf("listening on :%s, %s (bucket %q, database %q, quota %d MB)",
+			cfg.port, scheme, cfg.bucket, cfg.dbPath, cfg.quotaBytes>>20)
+		serveErr <- serve(srv, ln, cfg)
 	}()
 
 	select {
@@ -260,6 +272,28 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+}
+
+func newHTTPServer(cfg config, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              ":" + cfg.port,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		// Only used in HTTPS mode. TLS 1.0 and 1.1 are deprecated (RFC 8996).
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+}
+
+// serve runs srv on ln: HTTPS when a certificate is configured, which lets a
+// CDN reach the origin encrypted, and plain HTTP otherwise, as for local use.
+func serve(srv *http.Server, ln net.Listener, cfg config) error {
+	if cfg.tlsCert != "" {
+		return srv.ServeTLS(ln, cfg.tlsCert, cfg.tlsKey)
+	}
+	return srv.Serve(ln)
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
