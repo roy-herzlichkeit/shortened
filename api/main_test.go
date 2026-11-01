@@ -795,6 +795,36 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestAPINoStore(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint))
+	c := signup(t, h, "alice")
+
+	for _, tt := range []struct {
+		method, target, body string
+		opts                 []reqOpt
+	}{
+		{http.MethodGet, "/health", "", nil},
+		{http.MethodPost, "/auth/signup", creds("bob", "correct horse battery"), nil},
+		{http.MethodPost, "/auth/login", creds("alice", "correct horse battery"), nil},
+		{http.MethodGet, "/auth/me", "", []reqOpt{withCookie(c)}},
+		{http.MethodGet, "/auth/me", "", nil}, // 401, errors too
+		{http.MethodPost, "/upload-url", `{"filename":"a.txt","size":1}`, []reqOpt{withCookie(c)}},
+		{http.MethodGet, "/download-url?key=nope", "", []reqOpt{withCookie(c)}},
+		{http.MethodGet, "/files", "", nil},
+		{http.MethodPost, "/auth/logout", "", []reqOpt{withCookie(c)}},
+	} {
+		rec := do(t, h, tt.method, tt.target, tt.body, tt.opts...)
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("%s %s (status %d): Cache-Control = %q, want no-store", tt.method, tt.target, rec.Code, got)
+		}
+	}
+
+	// The page stays cacheable-with-revalidation; it holds nothing per user.
+	if got := do(t, h, http.MethodGet, "/", "").Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("GET /: Cache-Control = %q, want no-cache", got)
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	set := func(env map[string]string) {
 		for _, k := range []string{"B2_KEY_ID", "B2_APP_KEY", "B2_ENDPOINT", "B2_REGION", "B2_BUCKET",

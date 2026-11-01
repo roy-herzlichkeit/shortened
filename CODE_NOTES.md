@@ -135,6 +135,13 @@ address. Behind a reverse proxy, every client would then share the proxy's
 address, so `TRUST_PROXY=true` switches to the last `X-Forwarded-For` entry,
 the one the proxy appended. Earlier entries are client-controlled and ignored.
 
+**API responses are never cached.** Every API route sends
+`Cache-Control: no-store`, errors included, because the answers are per user:
+file lists, signed links, the session cookie. A CDN in front must still use a
+no-caching policy (CloudFront: `CachingDisabled`), since a policy with a
+minimum TTL above zero overrides the header. The page itself keeps
+`no-cache`, as it holds nothing per user.
+
 **The look.** The design is a neon-noir theme: hard yellow `#fcee0a` on
 near-black, cyan and red accents, cut-corner panels and buttons, Rajdhani and
 Share Tech Mono from Google Fonts, scanlines and a glitch title. It's inspired

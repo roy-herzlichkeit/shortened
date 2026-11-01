@@ -143,19 +143,30 @@ func newServer(ctx context.Context, cfg config, db *sql.DB) (*server, error) {
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
+	mux.Handle("/health", noStore(http.HandlerFunc(s.handleHealth)))
 
-	mux.Handle("/auth/signup", s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleSignup))))
-	mux.Handle("/auth/login", s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleLogin))))
-	mux.Handle("/auth/logout", s.sameOrigin(http.HandlerFunc(s.handleLogout)))
-	mux.Handle("/auth/me", s.requireUser(s.handleMe))
+	mux.Handle("/auth/signup", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleSignup)))))
+	mux.Handle("/auth/login", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleLogin)))))
+	mux.Handle("/auth/logout", noStore(s.sameOrigin(http.HandlerFunc(s.handleLogout))))
+	mux.Handle("/auth/me", noStore(s.requireUser(s.handleMe)))
 
-	mux.Handle("/upload-url", s.requireUser(s.handleUploadURL))
-	mux.Handle("/files", s.requireUser(s.handleFiles))
-	mux.Handle("/download-url", s.requireUser(s.handleDownloadURL))
+	mux.Handle("/upload-url", noStore(s.requireUser(s.handleUploadURL)))
+	mux.Handle("/files", noStore(s.requireUser(s.handleFiles)))
+	mux.Handle("/download-url", noStore(s.requireUser(s.handleDownloadURL)))
 
 	mux.Handle("/", s.pageHandler())
 	return mux
+}
+
+// noStore marks a response as never cacheable. API answers are per user (file
+// lists, signed links, the session cookie), so a shared cache such as a CDN
+// must never keep one and hand it to someone else. It is set before the
+// handler runs, so error responses carry it too.
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // pageHandler serves the embedded web page. The page and the API share an
