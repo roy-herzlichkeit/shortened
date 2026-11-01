@@ -28,15 +28,25 @@ const (
 	sessionTTL     = 30 * 24 * time.Hour
 	minPasswordLen = 8
 	maxPasswordLen = 72 // bcrypt ignores everything past 72 bytes, so refuse it
-	bcryptCost     = 12
 )
+
+// bcryptCost is a variable only so tests can drop it to bcrypt.MinCost; under
+// the race detector cost 12 makes each hash take seconds.
+var bcryptCost = 12
 
 var usernamePattern = regexp.MustCompile(`^[a-z0-9_-]{3,32}$`)
 
 // dummyHash is compared against when a login names an unknown user, so that a
 // wrong username takes as long as a wrong password and the response time does
-// not reveal which usernames exist.
-var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("not-a-real-password"), bcryptCost)
+// not reveal which usernames exist. It is built on first use so it picks up
+// the cost in effect then.
+var dummyHash = sync.OnceValue(func() []byte {
+	h, err := bcrypt.GenerateFromPassword([]byte("not-a-real-password"), bcryptCost)
+	if err != nil {
+		panic(err) // only fails for an invalid cost, which is a programming error
+	}
+	return h
+})
 
 type user struct {
 	id       int64
@@ -174,7 +184,7 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		`SELECT id, password_hash FROM users WHERE username = ?`, c.Username).Scan(&id, &hash)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(c.Password)) // only spent for its timing
+		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(c.Password)) // only spent for its timing
 		writeError(w, http.StatusUnauthorized, "wrong username or password")
 		return
 	case err != nil:
