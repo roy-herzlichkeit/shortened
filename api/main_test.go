@@ -70,6 +70,7 @@ type reqOpt func(*http.Request)
 func withCookie(c *http.Cookie) reqOpt { return func(r *http.Request) { r.AddCookie(c) } }
 func withOrigin(o string) reqOpt       { return func(r *http.Request) { r.Header.Set("Origin", o) } }
 func withRemoteAddr(a string) reqOpt   { return func(r *http.Request) { r.RemoteAddr = a } }
+func withHost(h string) reqOpt         { return func(r *http.Request) { r.Host = h } }
 
 func do(t *testing.T, h http.Handler, method, target, body string, opts ...reqOpt) *httptest.ResponseRecorder {
 	t.Helper()
@@ -311,6 +312,42 @@ func TestCrossOriginRefused(t *testing.T) {
 	if rec := do(t, h, http.MethodPost, "/auth/login", creds("alice", "correct horse battery"),
 		withOrigin("http://example.com")); rec.Code != http.StatusOK {
 		t.Errorf("same-origin login: status %d, want 200", rec.Code)
+	}
+}
+
+// Behind CloudFront, with the viewer's Host forwarded, Origin and Host name
+// the public domain (or the distribution's own name) and must match.
+func TestSameOriginBehindCDN(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint))
+	signup(t, h, "alice")
+	login := creds("alice", "correct horse battery")
+
+	for _, tt := range []struct {
+		origin, host string
+		want         int
+	}{
+		{"https://herzlichkeit-zero.click", "herzlichkeit-zero.click", http.StatusOK},
+		{"https://d111111abcdef8.cloudfront.net", "d111111abcdef8.cloudfront.net", http.StatusOK},
+		{"https://herzlichkeit-zero.click", "d111111abcdef8.cloudfront.net", http.StatusForbidden},
+		{"https://d111111abcdef8.cloudfront.net", "herzlichkeit-zero.click", http.StatusForbidden},
+		{"https://evil.example", "herzlichkeit-zero.click", http.StatusForbidden},
+		// www and the apex are different hosts; www must redirect to the apex.
+		{"https://www.herzlichkeit-zero.click", "herzlichkeit-zero.click", http.StatusForbidden},
+	} {
+		rec := do(t, h, http.MethodPost, "/auth/login", login, withOrigin(tt.origin), withHost(tt.host))
+		if rec.Code != tt.want {
+			t.Errorf("Origin %s, Host %s: status %d, want %d", tt.origin, tt.host, rec.Code, tt.want)
+		}
+	}
+}
+
+func TestSessionCookieFlags(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint)) // cookieSecure: true, the default
+	rec := do(t, h, http.MethodPost, "/auth/signup", creds("alice", "correct horse battery"))
+	c := sessionFrom(t, rec)
+	if !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" {
+		t.Errorf("session cookie: Secure %v, HttpOnly %v, SameSite %v, Path %q; want Secure, HttpOnly, Lax, /",
+			c.Secure, c.HttpOnly, c.SameSite, c.Path)
 	}
 }
 
