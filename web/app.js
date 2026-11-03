@@ -4,6 +4,7 @@
 // HttpOnly session cookie rides along automatically.
 
 const MAX_BYTES = 50 * 1024 * 1024;
+const MAX_NAME = 120;
 
 const $ = (id) => document.getElementById(id);
 
@@ -27,12 +28,17 @@ const fileName = $("file-name");
 const uploadButton = $("upload");
 const progress = $("progress");
 const progressBar = $("progress-bar");
+const cancelButton = $("cancel-upload");
+const conflictDialog = $("conflict");
+const conflictText = $("conflict-text");
 const refreshButton = $("refresh");
 const filesEl = $("files");
 const statusEl = $("status");
 
 let mode = "login";
 let quota = { used: 0, total: 0 };
+let currentFiles = [];
+let activeUpload = null; // the XHR of the upload in progress, for Cancel
 
 function setStatus(text, kind) {
   statusEl.textContent = text;
@@ -40,14 +46,20 @@ function setStatus(text, kind) {
 }
 
 class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, body) {
     super(message);
     this.status = status;
+    this.body = body || null;
   }
 }
 
 async function api(path, options) {
-  const res = await fetch(path, options || {});
+  let res;
+  try {
+    res = await fetch(path, options || {});
+  } catch (_) {
+    throw new ApiError("Couldn't reach the server. Check your connection and try again.", 0);
+  }
   let body = null;
   if (res.status !== 204) {
     try {
@@ -57,7 +69,7 @@ async function api(path, options) {
     }
   }
   if (!res.ok) {
-    throw new ApiError((body && body.error) || "Request failed with HTTP " + res.status, res.status);
+    throw new ApiError((body && body.error) || "Request failed with HTTP " + res.status, res.status, body);
   }
   return body;
 }
@@ -80,7 +92,8 @@ function handleError(err) {
   setStatus(err.message, "error");
 }
 
-function formatBytes(bytes) {
+// "12.3 MB": one decimal, dropped when it is zero ("500 MB").
+function formatSize(bytes) {
   if (bytes < 1024) return bytes + " B";
   const units = ["KB", "MB", "GB", "TB"];
   let value = bytes;
@@ -89,7 +102,26 @@ function formatBytes(bytes) {
     value /= 1024;
     unit += 1;
   } while (value >= 1024 && unit < units.length - 1);
-  return (value < 10 ? value.toFixed(1) : Math.round(value)) + " " + units[unit];
+  return value.toFixed(1).replace(/\.0$/, "") + " " + units[unit];
+}
+
+// The same rules as the server: spaces become "-", then only A-Z a-z 0-9 . _ -
+// are allowed. Returns { name } or { error }.
+function checkFilename(raw) {
+  const name = raw.replace(/ /g, "-");
+  if (!name) return { error: "The file needs a name." };
+  const bad = [...new Set(name.replace(/[A-Za-z0-9._-]/g, ""))];
+  if (bad.length > 0) {
+    return {
+      error: "File names may use only letters, digits, dot, underscore and dash. Rename the file to remove " +
+        bad.map((c) => "\u201c" + c + "\u201d").join(" ") + "."
+    };
+  }
+  if (new TextEncoder().encode(name).length > MAX_NAME) {
+    return { error: "File name is longer than " + MAX_NAME + " characters. Rename the file first." };
+  }
+  if (!/[A-Za-z0-9]/.test(name)) return { error: "File name needs at least one letter or digit." };
+  return { name: name };
 }
 
 /* ---------- Views ---------- */
@@ -125,12 +157,13 @@ function setMode(next) {
 function renderUsage(used, total) {
   quota = { used: used, total: total };
   const pct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
-  usageText.textContent = formatBytes(used) + " / " + formatBytes(total);
+  usageText.textContent = formatSize(used) + " of " + formatSize(total);
   usageBar.style.width = pct + "%";
   usage.classList.toggle("is-full", pct >= 90);
 }
 
 function renderFiles(files) {
+  currentFiles = files || [];
   filesEl.replaceChildren();
   if (!files || files.length === 0) {
     const empty = document.createElement("li");
@@ -150,7 +183,7 @@ function renderFiles(files) {
     const meta = document.createElement("span");
     meta.className = "file-meta";
     const when = file.lastModified ? new Date(file.lastModified).toLocaleString() : "";
-    meta.textContent = formatBytes(file.size) + (when ? " · " + when : "");
+    meta.textContent = formatSize(file.size) + (when ? " · " + when : "");
 
     const actions = document.createElement("span");
     actions.className = "file-actions";
@@ -193,8 +226,19 @@ async function refresh() {
     throw err;
   }
   renderFiles(files);
+  await refreshUsage();
+}
+
+async function refreshUsage() {
   const me = await api("/auth/me");
   renderUsage(me.usedBytes, me.quotaBytes);
+}
+
+// After an error the ledger may have changed (a reservation released, a
+// missing file dropped), so redraw what the server now says. A failure here
+// must not hide the first error.
+function refreshQuietly() {
+  refresh().catch(() => {});
 }
 
 async function start() {
@@ -256,7 +300,16 @@ async function downloadFile(file, button) {
     setStatus("Link signed; your browser should start the download.");
     window.location.href = signed.url;
   } catch (err) {
-    handleError(err);
+    if (err instanceof ApiError && err.status === 404) {
+      // The server has dropped the file from the ledger; show the list
+      // without it, and keep the message.
+      setStatus((file.name || file.key) + ": " + err.message + ".", "error");
+      refreshQuietly();
+    } else if (err instanceof ApiError && err.status === 401) {
+      handleError(err);
+    } else {
+      setStatus("Couldn't download " + (file.name || file.key) + ": " + err.message, "error");
+    }
   } finally {
     button.disabled = false;
   }
@@ -272,13 +325,17 @@ async function deleteFile(file, button) {
   } catch (err) {
     handleError(err);
     button.disabled = false;
+    refreshQuietly();
   }
 }
 
 // fetch() cannot report upload progress, so the PUT to the bucket uses XHR.
+class UploadCancelled extends Error {}
+
 function putWithProgress(url, file) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    activeUpload = xhr;
     xhr.open("PUT", url);
     xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
     xhr.upload.addEventListener("progress", (e) => {
@@ -291,8 +348,37 @@ function putWithProgress(url, file) {
     xhr.addEventListener("error", () => {
       reject(new Error("Upload failed: the bucket could not be reached (check its CORS rules)."));
     });
+    xhr.addEventListener("abort", () => reject(new UploadCancelled("Upload cancelled.")));
+    xhr.addEventListener("loadend", () => {
+      if (activeUpload === xhr) activeUpload = null;
+    });
     xhr.send(file);
   });
+}
+
+// askConflict shows the same-name dialog and resolves to "replace",
+// "keepboth" or "cancel".
+function askConflict(name, suggestion) {
+  return new Promise((resolve) => {
+    conflictText.textContent = "You already have a file named " + name +
+      ". Replace it, keep both (the new one is stored as " + suggestion + "), or cancel?";
+    conflictDialog.returnValue = "cancel";
+    conflictDialog.addEventListener("close", () => resolve(conflictDialog.returnValue || "cancel"), { once: true });
+    conflictDialog.showModal();
+  });
+}
+
+// requestUpload asks for a signed PUT link, and on a name clash asks the user
+// what to do and tries again with that choice. Resolves to null on Cancel.
+async function requestUpload(name, size) {
+  try {
+    return await postJSON("/upload-url", { filename: name, size: size });
+  } catch (err) {
+    if (!(err instanceof ApiError && err.status === 409 && err.body && err.body.conflict)) throw err;
+    const choice = await askConflict(err.body.name, err.body.suggestion);
+    if (choice === "cancel") return null;
+    return postJSON("/upload-url", { filename: name, size: size, onConflict: choice });
+  }
 }
 
 async function upload() {
@@ -301,34 +387,70 @@ async function upload() {
     setStatus("Choose a file first.", "error");
     return;
   }
+  const checked = checkFilename(file.name);
+  if (checked.error) {
+    setStatus(checked.error, "error");
+    return;
+  }
   if (file.size > MAX_BYTES) {
     setStatus("Files must be 50 MB or smaller.", "error");
     return;
   }
-  if (quota.total > 0 && quota.used + file.size > quota.total) {
-    setStatus("Not enough storage left for this file.", "error");
+  // A replace frees the old file's space, so only the server can judge that.
+  const sameName = currentFiles.some((f) => f.name === checked.name);
+  if (!sameName && quota.total > 0 && quota.used + file.size > quota.total) {
+    setStatus("Not enough storage left for this file: " + formatSize(quota.used) + " of " +
+      formatSize(quota.total) + " used.", "error");
     return;
   }
 
   uploadButton.disabled = true;
+  let signed = null;
   try {
     setStatus("Requesting an upload link…");
-    const signed = await postJSON("/upload-url", { filename: file.name, size: file.size });
+    signed = await requestUpload(checked.name, file.size);
+    if (!signed) {
+      setStatus("Upload cancelled.");
+      return;
+    }
 
-    setStatus("Uploading " + file.name + "…");
+    setStatus("Uploading " + signed.name + "…");
     progressBar.style.width = "0%";
     progress.hidden = false;
-    await putWithProgress(signed.url, file);
+    try {
+      await putWithProgress(signed.url, file);
+    } catch (err) {
+      // The PUT failed or was cancelled: give the reservation back now. The
+      // server keeps the file if the bytes did land after all.
+      await releaseUpload(signed.key);
+      throw err;
+    }
+
+    setStatus("Checking the upload…");
+    const usage = await api("/files/confirm?key=" + encodeURIComponent(signed.key), { method: "POST" });
+    renderUsage(usage.usedBytes, usage.quotaBytes);
 
     fileInput.value = "";
     fileName.textContent = "No file selected";
-    setStatus("Upload complete.");
+    setStatus("Upload complete: " + signed.name + (signed.name !== checked.name ? " (kept both)" : "") + ".");
     await refresh();
   } catch (err) {
-    handleError(err);
+    if (err instanceof UploadCancelled) setStatus(err.message);
+    else handleError(err);
+    refreshQuietly();
   } finally {
     progress.hidden = true;
     uploadButton.disabled = false;
+  }
+}
+
+async function releaseUpload(key) {
+  try {
+    const usage = await api("/files/release?key=" + encodeURIComponent(key), { method: "POST" });
+    renderUsage(usage.usedBytes, usage.quotaBytes);
+  } catch (_) {
+    // The reservation still lapses on its own; the refresh after the error
+    // shows whatever the server has.
   }
 }
 
@@ -339,10 +461,13 @@ modeSignup.addEventListener("click", () => setMode("signup"));
 authForm.addEventListener("submit", submitAuth);
 logoutButton.addEventListener("click", logout);
 uploadButton.addEventListener("click", upload);
+cancelButton.addEventListener("click", () => {
+  if (activeUpload) activeUpload.abort();
+});
 refreshButton.addEventListener("click", () => refresh().catch(handleError));
 fileInput.addEventListener("change", () => {
   const file = fileInput.files[0];
-  fileName.textContent = file ? file.name + " · " + formatBytes(file.size) : "No file selected";
+  fileName.textContent = file ? file.name + " · " + formatSize(file.size) : "No file selected";
 });
 
 start();

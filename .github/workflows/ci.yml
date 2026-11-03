@@ -154,8 +154,13 @@ jobs:
           expect 413 -b "$jar" -H "$json" -d '{"filename":"a.bin","size":52428801}' "$base/upload-url"
           expect 400 -b "$jar" "$base/download-url?key=..%2Fsecret"
           expect 404 -b "$jar" "$base/download-url?key=u%2F999%2F0123456789abcdef-theirs.txt"
-          expect 200 -b "$jar" "$base/download-url?key=u%2F1%2F0123456789abcdef-my..file.txt"
-          grep -q 'response-content-disposition=attachment' /tmp/body || { echo "download URL is not an attachment"; cat /tmp/body; exit 1; }
+          expect 400 -b "$jar" -H "$json" -d '{"filename":"photo (1).jpg","size":1}' "$base/upload-url"
+          grep -q "'('" /tmp/body || { echo "bad-name message doesn't name the character"; cat /tmp/body; exit 1; }
+          # The download checks the object in B2 before signing. With these fake
+          # credentials B2 can't answer, so the page must get a clear 502, not a
+          # link to nothing. (The attachment header is covered by TestDownloadURL.)
+          expect 502 -b "$jar" "$base/download-url?key=u%2F1%2F0123456789abcdef-my..file.txt"
+          grep -q 'could not reach storage' /tmp/body || { echo "unexpected download error"; cat /tmp/body; exit 1; }
 
           # Sign out ends the session
           expect 204 -b "$jar" -X POST "$base/auth/logout"

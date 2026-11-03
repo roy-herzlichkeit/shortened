@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"strings"
 
 	_ "modernc.org/sqlite" // pure-Go driver, keeps CGO_ENABLED=0 builds working
@@ -14,8 +15,10 @@ import (
 //
 // The files table is the quota ledger. A row is written when an upload URL is
 // signed, with the exact size that URL allows, so URLs that are signed but not
-// yet used still count against the quota. syncFiles later reconciles the
-// ledger with what is really in the bucket.
+// yet used still count against the quota. The browser then confirms the upload
+// (confirmed_at is set once the object is seen in the bucket) or releases it
+// (the row goes at once). replaces names the file a "Replace" upload swaps out
+// when it is confirmed. syncFiles reconciles the ledger with the bucket.
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,10 +33,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
 CREATE TABLE IF NOT EXISTS files (
-	key        TEXT    PRIMARY KEY,
-	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-	size       INTEGER NOT NULL,
-	created_at INTEGER NOT NULL
+	key          TEXT    PRIMARY KEY,
+	user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	size         INTEGER NOT NULL,
+	created_at   INTEGER NOT NULL,
+	confirmed_at INTEGER NOT NULL DEFAULT 0,
+	replaces     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS files_user ON files(user_id);
 `
@@ -59,7 +64,56 @@ func openDB(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate users table: %w", err)
 	}
+	if err := migrateFilesColumns(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate files table: %w", err)
+	}
 	return db, nil
+}
+
+// migrateFilesColumns adds the ledger columns that came with confirm, release
+// and replace. Rows that existed before keep confirmed_at = 0, so they follow
+// the old rule: dropped once the reservation window has passed without an
+// object. Opening an already-migrated database does nothing.
+func migrateFilesColumns(db *sql.DB) error {
+	have := map[string]bool{}
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('files')`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	var added []string
+	for _, col := range []struct{ name, ddl string }{
+		{"confirmed_at", `ALTER TABLE files ADD COLUMN confirmed_at INTEGER NOT NULL DEFAULT 0`},
+		{"replaces", `ALTER TABLE files ADD COLUMN replaces TEXT NOT NULL DEFAULT ''`},
+	} {
+		if have[col.name] {
+			continue
+		}
+		if _, err := db.Exec(col.ddl); err != nil {
+			return err
+		}
+		added = append(added, col.name)
+	}
+	if len(added) > 0 {
+		log.Printf("migration: files table gained %s", strings.Join(added, ", "))
+	}
+	return nil
 }
 
 // migrateUsersAutoincrement rebuilds a users table created before ids were

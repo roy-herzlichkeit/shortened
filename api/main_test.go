@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -119,26 +120,35 @@ func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 
 /* ---------- Names and keys ---------- */
 
-func TestCleanFilename(t *testing.T) {
-	tests := []struct{ in, want string }{
+func TestCheckFilename(t *testing.T) {
+	ok := []struct{ in, want string }{
 		{"report.pdf", "report.pdf"},
-		{"../../etc/passwd", "passwd"},
-		{`C:\Users\me\photo.jpg`, "photo.jpg"},
-		{"my file (1).txt", "my-file-1-.txt"},
-		{"...hidden", "hidden"},
+		{"my file 1.txt", "my-file-1.txt"},
 		{"my..file.txt", "my..file.txt"},
-		{"ünïcode.md", "n-code.md"},
-		{"", ""},
-		{"///", ""},
-		{strings.Repeat("a", 200) + ".tar", strings.Repeat("a", 116) + ".tar"},
+		{".env", ".env"},
+		{"a-_.b", "a-_.b"},
+		{strings.Repeat("a", 116) + ".tar", strings.Repeat("a", 116) + ".tar"},
 	}
-	for _, tt := range tests {
-		got := cleanFilename(tt.in)
-		if got != tt.want {
-			t.Errorf("cleanFilename(%q) = %q, want %q", tt.in, got, tt.want)
+	for _, tt := range ok {
+		got, err := checkFilename(tt.in)
+		if err != nil || got != tt.want {
+			t.Errorf("checkFilename(%q) = %q, %v; want %q", tt.in, got, err, tt.want)
 		}
-		if len(got) > maxNameLen {
-			t.Errorf("cleanFilename(%q) is %d bytes, over the %d limit", tt.in, len(got), maxNameLen)
+	}
+	bad := []struct{ in, mention string }{
+		{"", "name"},
+		{"../../etc/passwd", "'/'"},
+		{`C:\Users\me\photo.jpg`, `':' '\\'`},
+		{"my file (1).txt", "'(' ')'"},
+		{"ünïcode.md", "'ü' 'ï'"},
+		{"...", "letter or digit"},
+		{"---", "letter or digit"},
+		{strings.Repeat("a", 117) + ".tar", "longer than 120"},
+	}
+	for _, tt := range bad {
+		_, err := checkFilename(tt.in)
+		if err == nil || !strings.Contains(err.Error(), tt.mention) {
+			t.Errorf("checkFilename(%q) error = %v; want one mentioning %s", tt.in, err, tt.mention)
 		}
 	}
 }
@@ -146,18 +156,44 @@ func TestCleanFilename(t *testing.T) {
 // Every key the upload handler can issue must pass validKey; an old ".." check
 // once broke this for names like "my..file.txt".
 func TestIssuedKeysAreValid(t *testing.T) {
-	for _, in := range []string{"my..file.txt", "a.b.c", "x", strings.Repeat("z", 300) + ".gz", "a-_.b"} {
-		id, err := newID()
+	taken := map[string]bool{}
+	for _, in := range []string{"my..file.txt", "a.b.c", "x", strings.Repeat("z", 117) + ".gz", "a-_.b", "with space.txt"} {
+		name, err := checkFilename(in)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("checkFilename(%q): %v", in, err)
 		}
-		key := userPrefix(42) + id + "-" + cleanFilename(in)
-		if !validKey(key) {
-			t.Errorf("key %q built from %q is rejected by validKey", key, in)
+		for _, n := range []string{name, freeName(name, taken)} {
+			id, err := newID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := userPrefix(42) + id + "-" + n
+			if !validKey(key) {
+				t.Errorf("key %q built from %q is rejected by validKey", key, in)
+			}
+			if got := displayName(key); got != n {
+				t.Errorf("displayName(%q) = %q, want %q", key, got, n)
+			}
 		}
-		if got := displayName(key); got != cleanFilename(in) {
-			t.Errorf("displayName(%q) = %q, want %q", key, got, cleanFilename(in))
+	}
+}
+
+func TestFreeName(t *testing.T) {
+	taken := map[string]bool{"a.txt": true, "a-1.txt": true, "a-2.txt": true, ".env": true}
+	for in, want := range map[string]string{
+		"a.txt":    "a-3.txt",
+		"b.txt":    "b-1.txt",
+		".env":     ".env-1",
+		"README":   "README-1",
+		"x.tar.gz": "x.tar-1.gz",
+	} {
+		if got := freeName(in, taken); got != want {
+			t.Errorf("freeName(%q) = %q, want %q", in, got, want)
 		}
+	}
+	long := strings.Repeat("z", 117) + ".gz"
+	if got := freeName(long, nil); len(got) > maxNameLen || !strings.HasSuffix(got, "-1.gz") {
+		t.Errorf("freeName(long) = %q (%d bytes)", got, len(got))
 	}
 }
 
@@ -398,14 +434,15 @@ type fakeVersion struct {
 }
 
 // fakeB2 answers just enough of the S3 API for ListObjectsV2,
-// ListObjectVersions and DeleteObject. Like B2, it keeps every version: a
+// ListObjectVersions, HeadObject and DeleteObject. Like B2, it keeps every version: a
 // DeleteObject without a version ID only adds a hide marker, and one with a
 // version ID removes that version for good.
 type fakeB2 struct {
 	mu       sync.Mutex
 	versions map[string][]fakeVersion // oldest first
 	nextID   int
-	pageSize int // ListObjectVersions entries per page
+	pageSize int  // ListObjectVersions entries per page
+	headFail bool // HEAD answers 500, as when B2 is unreachable
 }
 
 func newFakeB2(t *testing.T) (*fakeB2, string) {
@@ -432,6 +469,20 @@ func (f *fakeB2) hide(key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.versions[key] = append(f.versions[key], fakeVersion{id: f.newID(), modified: time.Now(), marker: true})
+}
+
+// drop removes key and every version of it, as deleting it in the B2 web UI
+// or with the b2 CLI would, without the app knowing.
+func (f *fakeB2) drop(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.versions, key)
+}
+
+func (f *fakeB2) setHeadFail(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.headFail = v
 }
 
 func (f *fakeB2) setPageSize(n int) {
@@ -541,6 +592,22 @@ func (f *fakeB2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.WriteString(`</ListVersionsResult>`)
 		w.Header().Set("Content-Type", "application/xml")
 		w.Write([]byte(b.String()))
+
+	case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/test-bucket/"):
+		key, _ := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/test-bucket/"))
+		if f.headFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		vs := f.versions[key]
+		if len(vs) == 0 || vs[len(vs)-1].marker {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		v := vs[len(vs)-1]
+		w.Header().Set("Content-Length", strconv.FormatInt(v.size, 10))
+		w.Header().Set("Last-Modified", v.modified.UTC().Format(http.TimeFormat))
+		w.WriteHeader(http.StatusOK)
 
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/test-bucket/"):
 		key, _ := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/test-bucket/"))
@@ -776,9 +843,11 @@ func TestDeleteFile(t *testing.T) {
 }
 
 func TestDownloadURL(t *testing.T) {
-	s, h := newTestServer(t, testConfig(testEndpoint))
+	b2, endpoint := newFakeB2(t)
+	s, h := newTestServer(t, testConfig(endpoint))
 	c := signup(t, h, "alice")
 	key := userPrefix(userID(t, s, "alice")) + "0123456789abcdef-my..file.txt"
+	b2.put(key, 10, time.Now())
 
 	rec := do(t, h, http.MethodGet, "/download-url?key="+url.QueryEscape(key), "", withCookie(c))
 	if rec.Code != http.StatusOK {

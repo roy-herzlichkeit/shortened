@@ -65,9 +65,9 @@
         <div class="meter" id="usage">
           <div class="meter-head">
             <span>Storage</span>
-            <span id="usage-text" class="mono">0 B / 0 B</span>
+            <span id="usage-text" class="mono">0 B of 0 B</span>
           </div>
-          <div class="bar"><div id="usage-bar" class="bar-fill"></div></div>
+          <div class="bar" aria-hidden="true"><div id="usage-bar" class="bar-fill"></div></div>
         </div>
 
         <div class="upload-row">
@@ -79,7 +79,12 @@
           <button id="upload" class="btn btn-primary" type="button">Upload</button>
         </div>
 
-        <div id="progress" class="bar bar-progress" hidden><div id="progress-bar" class="bar-fill"></div></div>
+        <p class="hint">Names may use letters, digits, dot, underscore and dash. Spaces become dashes.</p>
+
+        <div id="progress" class="progress-row" hidden>
+          <div class="bar bar-progress"><div id="progress-bar" class="bar-fill"></div></div>
+          <button id="cancel-upload" class="btn btn-danger btn-small" type="button">Cancel</button>
+        </div>
       </div>
     </div>
 
@@ -96,6 +101,18 @@
 
   <p id="status" class="status" role="status" aria-live="polite"></p>
 </main>
+
+<dialog id="conflict" class="dialog" aria-labelledby="conflict-title">
+  <form method="dialog" class="frame-inner">
+    <h2 id="conflict-title" class="frame-title"><span class="tag">!!</span> Name in use</h2>
+    <p id="conflict-text" class="dialog-text"></p>
+    <div class="dialog-actions">
+      <button type="submit" class="btn btn-danger" value="replace">Replace</button>
+      <button type="submit" class="btn btn-primary" value="keepboth">Keep both</button>
+      <button type="submit" class="btn btn-ghost" value="cancel" autofocus>Cancel</button>
+    </div>
+  </form>
+</dialog>
 
 <footer class="footer mono">
   <span>// Max 50 MB per file</span>

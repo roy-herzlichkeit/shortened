@@ -87,8 +87,8 @@ body::after {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.topbar .btn-ghost { color: #000; border-color: #000; }
-.topbar .btn-ghost:hover { background: #000; color: var(--yellow); }
+.topbar .btn-ghost { color: #000; --btn-line: #000; --btn-glow: rgba(0, 0, 0, .5); --btn-focus: var(--red); }
+.topbar .btn-ghost:hover:not(:disabled) { color: var(--yellow); --btn-fill: #000; }
 
 /* ---------- Layout ---------- */
 
@@ -239,9 +239,29 @@ main {
 
 /* ---------- Buttons ---------- */
 
+/* A clip-path on the button itself would cut its border and any glow off along
+   the slanted corner. So the button stays unclipped, and two layers behind
+   the label draw the shape: ::before is the fill and ::after the border, a
+   ring traced outer edge then inner edge with evenodd. A drop-shadow filter on
+   the button then glows around the visible shape, slant included.
+   On the 45° edge the inner line sits --bw × (√2 − 1) further in, so the
+   border is the same thickness there as on the straight sides. */
 .btn {
-  white-space: nowrap;
   --btn-cut: 10px;
+  --bw: 1px;
+  --btn-fill: transparent;
+  --btn-line: transparent;
+  --btn-glow: transparent;
+  --btn-shape: polygon(0 0, 100% 0, 100% calc(100% - var(--btn-cut)), calc(100% - var(--btn-cut)) 100%, 0 100%);
+  --btn-ring: polygon(evenodd,
+    0 0, 100% 0, 100% calc(100% - var(--btn-cut)), calc(100% - var(--btn-cut)) 100%, 0 100%, 0 0,
+    var(--bw) var(--bw), var(--bw) calc(100% - var(--bw)),
+    calc(100% - var(--btn-cut) - var(--bw) * .4142) calc(100% - var(--bw)),
+    calc(100% - var(--bw)) calc(100% - var(--btn-cut) - var(--bw) * .4142),
+    calc(100% - var(--bw)) var(--bw), var(--bw) var(--bw));
+  position: relative;
+  isolation: isolate;
+  white-space: nowrap;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -250,24 +270,45 @@ main {
   font: 700 16px var(--font);
   text-transform: uppercase;
   letter-spacing: .14em;
-  border: 1px solid transparent;
+  background: none;
+  border: 0;
   border-radius: 0;
+  outline: none;
   cursor: pointer;
-  clip-path: polygon(0 0, 100% 0, 100% calc(100% - var(--btn-cut)), calc(100% - var(--btn-cut)) 100%, 0 100%);
-  transition: background .12s, color .12s, transform .08s;
+  transition: color .12s, filter .12s, transform .08s;
 }
+.btn::before,
+.btn::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  transition: background .12s;
+}
+.btn::before { background: var(--btn-fill); clip-path: var(--btn-shape); }
+.btn::after { background: var(--btn-line); clip-path: var(--btn-ring); }
+
+.btn:hover:not(:disabled) { filter: drop-shadow(0 0 6px var(--btn-glow)); }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: .45; cursor: progress; }
-.btn:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+/* Keyboard focus: a thicker ring in the focus colour, plus the glow. */
+.btn:focus-visible {
+  --bw: 2px;
+  --btn-line: var(--btn-focus, var(--cyan));
+  filter: drop-shadow(0 0 7px var(--btn-focus, var(--cyan)));
+}
 
-.btn-primary { color: #000; background: var(--yellow); }
-.btn-primary:hover:not(:disabled) { background: var(--cyan); }
+.btn-primary { color: #000; --btn-fill: var(--yellow); --btn-line: var(--yellow); --btn-glow: var(--cyan); }
+.btn-primary:hover:not(:disabled) { --btn-fill: var(--cyan); --btn-line: var(--cyan); }
+/* On a cyan hover fill, a cyan focus ring would vanish. */
+.btn-primary:focus-visible { --btn-focus: var(--red); }
 
-.btn-ghost { color: var(--cyan); background: transparent; border-color: var(--cyan); }
-.btn-ghost:hover:not(:disabled) { color: #000; background: var(--cyan); }
+.btn-ghost { color: var(--cyan); --btn-line: var(--cyan); --btn-glow: var(--cyan); --btn-focus: var(--yellow); }
+.btn-ghost:hover:not(:disabled) { color: #000; --btn-fill: var(--cyan); }
 
-.btn-danger { color: var(--red); background: transparent; border-color: var(--red); }
-.btn-danger:hover:not(:disabled) { color: #fff; background: var(--red); }
+.btn-danger { color: var(--red); --btn-line: var(--red); --btn-glow: var(--red); }
+.btn-danger:hover:not(:disabled) { color: #fff; --btn-fill: var(--red); }
 
 .btn-small { --btn-cut: 7px; padding: 6px 14px; font-size: 13px; letter-spacing: .1em; }
 
@@ -295,7 +336,9 @@ main {
   transition: width .25s ease;
 }
 .meter.is-full .bar-fill { background: var(--red); }
-.bar-progress { margin-top: 16px; }
+.progress-row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+.progress-row[hidden] { display: none; }
+.progress-row .bar { flex: 1 1 auto; }
 .bar-progress .bar-fill { background: repeating-linear-gradient(90deg, var(--cyan) 0 10px, #00bfcc 10px 12px); }
 
 /* ---------- File picker ---------- */
@@ -381,6 +424,21 @@ main {
 }
 .file-meta { flex: 0 0 auto; font-family: var(--mono); font-size: 13px; color: var(--muted); }
 .file-actions { display: flex; gap: 8px; }
+
+/* ---------- Same-name dialog ---------- */
+
+.dialog {
+  width: min(480px, calc(100% - 32px));
+  padding: 0;
+  color: var(--text);
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid var(--cyan);
+  box-shadow: 0 0 24px rgba(0, 240, 255, .25);
+}
+.dialog .frame-inner { clip-path: none; }
+.dialog::backdrop { background: rgba(0, 0, 0, .7); }
+.dialog-text { margin: 0 0 18px; font-family: var(--mono); font-size: 14px; overflow-wrap: anywhere; }
+.dialog-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 
 /* ---------- Status and footer ---------- */
 
