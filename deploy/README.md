@@ -146,6 +146,58 @@ then execute.
      certificate. Allow about 10 minutes.
   3. Note the new `ImageIdInUse` output for later updates.
 
+## Backups (`backup.yaml`)
+
+A second stack, `shortened-backup`, deployed after the main one. Use the same
+change-set flow, with `CAPABILITY_NAMED_IAM` and the tag `Project=shortened`.
+
+| Resource | Notes |
+| --- | --- |
+| `SqliteCopy` (SSM association `shortened-sqlite-backup`) | 02:30 UTC every night, and once right after create. As uid 10001 it runs `sqlite3 .backup` of `/data/shortened.db` to `/data/backup/shortened.db` (through a temp file), then `PRAGMA integrity_check`. The run fails unless the check says `ok`. The DB is in WAL mode, so the live file is never copied as is. |
+| `Vault` (`shortened-vault`) | Kept on stack delete (`Retain`). |
+| `Plan` (`shortened-daily`) | 03:00 UTC daily, a 60-minute start window, recovery points deleted after `RetentionDays` (7). |
+| `Selection` | Only the data volume, by its ID (`DataVolumeId`). |
+| `BackupRole` (`shortened-backup-role`) | `AWSBackupServiceRolePolicyForBackup` and `...ForRestores`, with the `shortened-boundary` boundary. |
+
+Parameters: `DataVolumeId` and `InstanceId` default to the main stack's
+current outputs. After an AMI upgrade the instance ID changes, so update
+`InstanceId` too.
+
+Check the copy: State Manager → Associations → `shortened-sqlite-backup` →
+Execution history. The output ends `backup ok …: N bytes, M users`.
+
+### Restore
+
+Every recovery point holds the whole data volume, including last night's clean
+copy at `backup/shortened.db`. Use that copy, not the `shortened.db` next to
+it, which may have been caught mid-write.
+
+1. **Make a volume.** AWS Backup → `shortened-vault` → pick a recovery point →
+   Restore. Choose `us-east-1a`, gp3, encrypted, and the role
+   `shortened-backup-role`. Or call `StartRestoreJob` with
+   `Metadata={"availabilityZone":"us-east-1a","volumeType":"gp3","encrypted":"true"}`.
+2. **Read it on a spare instance.** This is the safe way to check it. Launch a
+   t4g.nano in `us-east-1a` with the profile `shortened-instance-profile`, no key
+   pair and a security group with no inbound rules. Attach the volume as
+   `/dev/sdf`. Then, through Session Manager:
+   ```
+   dnf install -y sqlite
+   mkdir -p /mnt/r && mount -o ro,norecovery /dev/nvme1n1 /mnt/r
+   sqlite3 'file:/mnt/r/backup/shortened.db?immutable=1' 'PRAGMA integrity_check; SELECT count(*) FROM users;'
+   ```
+   `norecovery` and `immutable=1` keep everything read-only.
+3. **Put it back into service.** Copy the file, not the volume:
+   1. On the server, run `systemctl stop shortened` and set aside the old DB with
+      `mv /data/shortened.db{,.old}; rm -f /data/shortened.db-wal /data/shortened.db-shm`.
+   2. Copy `backup/shortened.db` to `/data/shortened.db` with owner `10001:10001`,
+      mode `0644`. Move it through the spare instance's volume or S3.
+   3. Run `systemctl start shortened`.
+
+   Uploads after the backup stay in B2 but are not in the restored database.
+   They don't show in the file list and don't count toward the quota.
+4. **Clean up.** Detach and delete the restored volume, then terminate the
+   spare instance.
+
 ## Delete
 
 `DeleteStack` (turn termination protection off first). Ask first: this
@@ -176,8 +228,9 @@ Running 24/7 (730 h), prices before tax:
 | Public IPv4 (EIP), 730 h | $3.65 | $3.65 |
 | Route 53, 2 hosted zones (already exist) | $1.00 | $1.00 |
 | Snapshots, up to 8 GB | ≤ $0.40 | ≤ $0.40 |
+| AWS Backup, 7 daily EBS recovery points (incremental; only used blocks) | ≈ $0.05 | ≈ $0.05 |
 | CloudFront (under the free 1 TB and 10 M requests) | $0.00 | $0.00 |
-| **Total** | **≈ $6.33** | **≈ $18.59** |
+| **Total** | **≈ $6.38** | **≈ $18.64** |
 
 Unit prices: t4g.small $0.0168/h, gp3 $0.08/GB-month, snapshot $0.05/GB-month,
 IPv4 $0.005/h, hosted zone $0.50/month.

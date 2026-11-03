@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Backups for SHORTENED.: a nightly consistent SQLite copy on the data volume
+  (SSM State Manager), then a daily AWS Backup snapshot of that volume, kept
+  for 7 days. Deploy after the main stack (shortened.yaml).
+
+Parameters:
+  DataVolumeId:
+    Type: AWS::EC2::Volume::Id
+    Default: vol-047ea2267cc1c44e6
+    Description: The DataVolumeId output of the shortened stack. Only this volume is backed up.
+  InstanceId:
+    Type: AWS::EC2::Instance::Id
+    Default: i-00a930f6c22e7b35e
+    Description: The InstanceId output of the shortened stack. Runs the nightly SQLite copy.
+  RetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+
+Resources:
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shortened-backup-role
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/shortened-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: backup.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+      Tags:
+        - { Key: Project, Value: shortened }
+
+  # Retained on stack delete: a vault that still holds recovery points can't be
+  # deleted, and an empty vault costs nothing.
+  Vault:
+    Type: AWS::Backup::BackupVault
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: shortened-vault
+      BackupVaultTags: { Project: shortened }
+
+  Plan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: shortened-daily
+        BackupPlanRule:
+          # 03:00 UTC, 30 minutes after the SQLite copy below.
+          - RuleName: daily
+            TargetBackupVault: !Ref Vault
+            ScheduleExpression: cron(0 3 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle: { DeleteAfterDays: !Ref RetentionDays }
+            RecoveryPointTags: { Project: shortened, Name: shortened-data-backup }
+      BackupPlanTags: { Project: shortened }
+
+  Selection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref Plan
+      BackupSelection:
+        SelectionName: shortened-data-volume
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/${DataVolumeId}
+
+  # The DB is in WAL mode, so a snapshot of the live file can catch it mid-write.
+  # sqlite3 .backup makes a consistent copy on the same volume, and the snapshot
+  # then contains that clean copy. It runs as the app user (10001) so it never
+  # leaves root-owned -wal/-shm files that the app could not open. It also runs
+  # once right after the stack is created.
+  SqliteCopy:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: shortened-sqlite-backup
+      Name: AWS-RunShellScript
+      Targets:
+        - { Key: InstanceIds, Values: [!Ref InstanceId] }
+      ScheduleExpression: cron(30 2 ? * * *)
+      ComplianceSeverity: HIGH
+      Parameters:
+        executionTimeout: ["600"]
+        commands:
+          - |
+            set -euo pipefail
+            command -v sqlite3 >/dev/null || dnf install -y -q sqlite
+            install -d -o 10001 -g 10001 -m 0700 /data/backup
+            as_app() { setpriv --reuid=10001 --regid=10001 --clear-groups "$@"; }
+            tmp=/data/backup/shortened.db.tmp
+            rm -f "$tmp" "$tmp-wal" "$tmp-shm"
+            as_app sqlite3 -cmd ".timeout 15000" /data/shortened.db ".backup '$tmp'"
+            check=$(as_app sqlite3 "$tmp" "PRAGMA integrity_check;")
+            if [ "$check" != ok ]; then echo "integrity_check failed: $check"; exit 1; fi
+            users=$(as_app sqlite3 "$tmp" "SELECT count(*) FROM users;")
+            mv -f "$tmp" /data/backup/shortened.db
+            sync -f /data/backup/shortened.db
+            echo "backup ok $(date -u +%FT%TZ): $(stat -c %s /data/backup/shortened.db) bytes, $users users"
+
+Outputs:
+  VaultName:
+    Value: !Ref Vault
+  PlanId:
+    Value: !Ref Plan
+  BackupRoleArn:
+    Value: !GetAtt BackupRole.Arn
