@@ -56,7 +56,9 @@ The log is at `/var/log/shortened-bootstrap.log`.
 | `CertificateArn` | `…certificate/daae2cd6-…` | ISSUED; expires 2027-05-20, and ACM renews it while the validation CNAME stays |
 | `CloudFrontPrefixListId` | `pl-3b927c52` | |
 | `VpcId`, `SubnetId`, `AvailabilityZone` | default VPC, us-east-1a | t4g.small is not offered in us-east-1e; a Rule blocks it |
-| `ImageId` | `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64` | resolved again on every stack update, see below |
+| `ImageId` | `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64` | latest AMI; used only while `PinnedImageId` is empty |
+| `PinnedImageId` | empty | leave empty on create; on every update pass the `ImageIdInUse` output |
+| `AttachDataVolume` | `true` | `false` only for step 1 of an AMI upgrade |
 | `AppRef` | `main` | branch or tag to build |
 | `CertbotEmail` | `roy.herzlichkeit@gmail.com` | Let's Encrypt expiry mail |
 
@@ -116,16 +118,33 @@ then execute.
 - **New app version.** UserData runs only at first boot, so changing `AppRef`
   alone does not rebuild the app. On the instance, through Session Manager:
   `cd /opt/shortened-src && git fetch --depth 1 origin <ref> && git checkout FETCH_HEAD && docker build -t shortened . && systemctl restart shortened`.
-- **Check whether the instance will be replaced.** `ImageId` is an SSM
-  parameter, so every update resolves it again. When Amazon has published a
-  new AL2023 AMI, the change set shows `Server` with `Replacement: True`.
-  Replacing the instance replaces `DataVolumeAttachment`. The new attachment
-  can fail while the old instance still holds the volume. If it fails, the
-  stack rolls back and the data is safe. To take a new AMI on purpose:
-  1. Stop the old instance, or detach the volume, before you execute.
-  2. Expect a short outage.
-  3. The data volume is reused, never formatted again: `mkfs` runs only on a blank disk.
-  If you don't want a new AMI, override `ImageId` with the current AMI ID.
+- **Always pass `PinnedImageId`.** `ImageId` is an SSM parameter, so every
+  update resolves it again. Once Amazon publishes a new AL2023 AMI (every few
+  weeks), an update without a pinned image replaces the server. So on every
+  update, set `PinnedImageId` to the stack's `ImageIdInUse` output. In the
+  change set, `Server` must not show `Replacement: True`. If it does, delete
+  the change set and check the parameters.
+- **OS patches without a new AMI.** Through Session Manager:
+  `dnf upgrade --releasever=latest -y && reboot`. `/data` and the app come back
+  by themselves (fstab entry and `shortened.service`). This is the normal way
+  to stay patched.
+- **Moving to a new AMI** takes two updates and a few minutes of downtime.
+  Doing it in one update would fail: CloudFormation creates the new server
+  first, and the data volume can't attach to it while the old one still holds
+  it. The stack would roll back, with the data safe, but nothing would change.
+  1. Through Session Manager: `systemctl stop shortened && umount /data`.
+     Then update the stack with `AttachDataVolume=false` and the same
+     `PinnedImageId`. CloudFormation detaches the volume.
+  2. Update with `AttachDataVolume=true` and `PinnedImageId` set to the new AMI
+     ID, or empty for the latest. CloudFormation then:
+     - creates the new server and attaches the volume to it;
+     - moves the Elastic IP;
+     - terminates the old server.
+
+     The new server's first boot reuses the volume (`mkfs` runs only on a
+     blank disk), rebuilds the image and gets a new Let's Encrypt
+     certificate. Allow about 10 minutes.
+  3. Note the new `ImageIdInUse` output for later updates.
 
 ## Delete
 

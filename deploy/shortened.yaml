@@ -35,6 +35,23 @@ Parameters:
   ImageId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: >-
+      The latest AL2023 arm64 AMI. Re-resolved on every stack update, so it is
+      used only while PinnedImageId is empty.
+  PinnedImageId:
+    Type: String
+    Default: ""
+    AllowedPattern: ^(ami-[0-9a-f]{8,17})?$
+    Description: >-
+      Leave empty on create. On every update pass the ImageIdInUse output, so a
+      new Amazon AMI does not replace the instance. Change it only to upgrade.
+  AttachDataVolume:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Set false only for step 1 of an AMI upgrade (detaches /data from the old
+      instance). See deploy/README.md.
   AppRef:
     Type: String
     Default: main
@@ -49,6 +66,10 @@ Rules:
     Assertions:
       - Assert: !Not [!Equals [!Ref AvailabilityZone, us-east-1e]]
         AssertDescription: t4g.small is not offered in us-east-1e.
+
+Conditions:
+  UsePinnedImage: !Not [!Equals [!Ref PinnedImageId, ""]]
+  AttachData: !Equals [!Ref AttachDataVolume, "true"]
 
 Resources:
   # ---------- Network ----------
@@ -153,6 +174,7 @@ Resources:
 
   DataVolumeAttachment:
     Type: AWS::EC2::VolumeAttachment
+    Condition: AttachData
     Properties:
       InstanceId: !Ref Server
       VolumeId: !Ref DataVolume
@@ -161,7 +183,7 @@ Resources:
   Server:
     Type: AWS::EC2::Instance
     Properties:
-      ImageId: !Ref ImageId
+      ImageId: !If [UsePinnedImage, !Ref PinnedImageId, !Ref ImageId]
       InstanceType: t4g.small
       # Standard credits: never billed for surplus CPU (Unlimited is the default).
       CreditSpecification: { CPUCredits: standard }
@@ -368,3 +390,6 @@ Outputs:
     Value: !Ref ElasticIP
   DataVolumeId:
     Value: !Ref DataVolume
+  ImageIdInUse:
+    Description: Pass this as PinnedImageId on every update.
+    Value: !If [UsePinnedImage, !Ref PinnedImageId, !Ref ImageId]
