@@ -198,6 +198,28 @@ it, which may have been caught mid-write.
 4. **Clean up.** Detach and delete the restored volume, then terminate the
    spare instance.
 
+## Monitoring (`monitoring.yaml`)
+
+A third stack, `shortened-monitoring`. First update the main stack, so its
+instance role has `CloudWatchAgentServerPolicy` (the role is updated in place;
+`Server` must not show a replacement). Then create this stack with the
+`AlertEmail` parameter, and confirm the SNS subscription mail.
+
+| Resource | Notes |
+| --- | --- |
+| `Alerts` (SNS `shortened-alerts`) | Mails `AlertEmail` for every alarm and every return to OK. |
+| `shortened-system-check` | `StatusCheckFailed_System` ≥ 1 for 2 minutes → the EC2 **recover** action (same instance ID, Elastic IP and volumes) and a mail. |
+| `shortened-instance-check` | `StatusCheckFailed_Instance` ≥ 1 for 3 minutes → mail. |
+| `shortened-cpu-credits-low` | `CPUCreditBalance` < 50 for 15 minutes → mail. With standard credits, at 0 the CPU is held to the baseline. |
+| `shortened-cloudfront-5xx` | `5xxErrorRate` > 10 % in 2 of 3 five-minute periods → mail. No traffic counts as OK. |
+| `AppLogGroup` `/shortened/app` | 14-day retention. One stream per instance ID. |
+| `AgentConfig` (SSM `AmazonCloudWatch-shortened`) | CloudWatch agent: `mem_used_percent`, and disk `used_percent` on `/` and `/data` (namespace `CWAgent`, every 5 min), plus `/var/log/shortened/app.log`. |
+| `AgentSetup` (association `shortened-cloudwatch-agent`) | Installs the agent and logrotate, adds `shortened-journal-export.service` (copies the `shortened.service` journal to the log file, rotated daily) and starts the agent with the config. Runs once on create. |
+| `Budget` `shortened-monthly` | $10/month on costs tagged `Project=shortened`. Mails at 80 % actual and 100 % forecast. It reads $0 until the `Project` cost allocation tag is active. `CreateBudget=false` skips it. |
+
+After an AMI upgrade, update `InstanceId` in this stack and in
+`shortened-backup`.
+
 ## Delete
 
 `DeleteStack` (turn termination protection off first). Ask first: this
@@ -229,6 +251,7 @@ Running 24/7 (730 h), prices before tax:
 | Route 53, 2 hosted zones (already exist) | $1.00 | $1.00 |
 | Snapshots, up to 8 GB | ≤ $0.40 | ≤ $0.40 |
 | AWS Backup, 7 daily EBS recovery points (incremental; only used blocks) | ≈ $0.05 | ≈ $0.05 |
+| CloudWatch: 3 agent metrics, 4 alarms, the logs (inside the free tier: 10 metrics, 10 alarms, 5 GB logs) | $0.00 | $0.00 |
 | CloudFront (under the free 1 TB and 10 M requests) | $0.00 | $0.00 |
 | **Total** | **≈ $6.38** | **≈ $18.64** |
 
