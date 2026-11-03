@@ -1,0 +1,175 @@
+# Deploying SHORTENED. to AWS
+
+`shortened.yaml` is one CloudFormation stack in **us-east-1**. It runs the app
+on one EC2 t4g.small behind CloudFront, at
+`https://shortened.herzlichkeit-zero.click`. Every resource that takes tags is
+tagged `Project=shortened`.
+
+```
+viewer ──HTTPS──▶ CloudFront ──HTTPS (443, CloudFront prefix list only)──▶ EIP ─▶ EC2 t4g.small
+  (ACM cert)                     (Let's Encrypt cert on the origin)                 └ docker: shortened
+                                                                                    └ /data = separate EBS volume (SQLite)
+```
+
+## What the stack creates
+
+| Resource | Notes |
+| --- | --- |
+| `OriginSecurityGroup` (`shortened-origin`) | Inbound 443 from `pl-3b927c52` (CloudFront origin-facing) only. No SSH; use SSM Session Manager. |
+| `ElasticIP` and `ElasticIPAssociation` | CloudFront reaches the origin by the EIP's `ec2-a-b-c-d.compute-1.amazonaws.com` name. |
+| `InstanceRole` (`shortened-instance-role`) and `InstanceProfile` (`shortened-instance-profile`) | Permissions boundary `shortened-boundary`, `AmazonSSMManagedInstanceCore`, read `/shortened/*` in SSM, and Route 53 TXT changes only for `_acme-challenge.shortened.herzlichkeit-zero.click`. |
+| `DataVolume` and `DataVolumeAttachment` | 8 GiB gp3, encrypted, mounted at `/data`. `DeletionPolicy` and `UpdateReplacePolicy` are `Snapshot`. |
+| `Server` | t4g.small, standard CPU credits, latest AL2023 arm64 AMI (SSM parameter), IMDSv2 with hop limit 2, 8 GiB encrypted gp3 root, no key pair. |
+| `Distribution` | Existing ACM certificate, CachingDisabled and AllViewer managed policies, all 7 methods, redirect to HTTPS, PriceClass_200, HTTP/2 and 3, IPv6. |
+| `SiteRecordA` and `SiteRecordAAAA` | Aliases to the distribution in the `herzlichkeit-zero.click` zone. |
+
+The stack does **not** create the hosted zone, the ACM certificate, the SSM
+parameters or the permissions boundary. They already exist or you create them
+separately, and a stack delete leaves them alone.
+
+### What the instance does on first boot (UserData)
+
+The log is at `/var/log/shortened-bootstrap.log`.
+
+1. Waits for the data volume by its `/dev/disk/by-id` name, formats it as XFS
+   only if it is blank, adds it to fstab by UUID and mounts it on `/data`
+   (owner 10001, the container user).
+2. Installs docker, git and python3.
+3. Writes `shortened-env`. At every service start it turns SSM
+   `/shortened/*` into `/etc/shortened.env` (mode 0600). It never prints
+   values.
+4. Installs `shortened.service`. This runs the container with port 443 mapped
+   to 8443, TLS from `/etc/shortened/tls`, `COOKIE_SECURE=true` and
+   `TRUST_PROXY=true`.
+5. Clones `AppRef` from GitHub and runs `docker build` on the instance (arm64).
+6. Installs certbot and certbot-dns-route53 in a venv. Requests the
+   Let's Encrypt certificate with DNS-01, and a deploy hook copies it to
+   `/etc/shortened/tls` and restarts the app. A systemd timer runs
+   `certbot renew` twice a day.
+
+## Parameters
+
+| Name | Default | Notes |
+| --- | --- | --- |
+| `SiteName` | `shortened.herzlichkeit-zero.click` | |
+| `HostedZoneId` | `Z004479826BXL8T1YK32V` | the `herzlichkeit-zero.click` zone |
+| `CertificateArn` | `…certificate/daae2cd6-…` | ISSUED; expires 2027-05-20, and ACM renews it while the validation CNAME stays |
+| `CloudFrontPrefixListId` | `pl-3b927c52` | |
+| `VpcId`, `SubnetId`, `AvailabilityZone` | default VPC, us-east-1a | t4g.small is not offered in us-east-1e; a Rule blocks it |
+| `ImageId` | `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64` | resolved again on every stack update, see below |
+| `AppRef` | `main` | branch or tag to build |
+| `CertbotEmail` | `roy.herzlichkeit@gmail.com` | Let's Encrypt expiry mail |
+
+## Before the first deploy
+
+1. **Apply the phase 1b boundary.** Run `bash .agent/aws/phase1b/apply-phase1b.sh`.
+   It allows certbot to write `_acme-challenge.shortened.herzlichkeit-zero.click`.
+   Without it, certbot fails, the app has no certificate, and CloudFront
+   returns 502.
+2. **Delete the old empty stack.** The failed first attempt left the stack
+   `shortened` in `ROLLBACK_COMPLETE` with termination protection on. It has
+   no resources. Turn termination protection off, then delete it
+   (`UpdateTerminationProtection` false, `DeleteStack`).
+3. **Create the SSM parameters** under `/shortened/`. The parameter name, minus
+   the path, becomes the environment variable name. Never put the values in a
+   file or a commit.
+
+   | Parameter | Type |
+   | --- | --- |
+   | `/shortened/B2_KEY_ID` | SecureString |
+   | `/shortened/B2_APP_KEY` | SecureString |
+   | `/shortened/B2_ENDPOINT` | String |
+   | `/shortened/B2_REGION` | String |
+   | `/shortened/B2_BUCKET` | String |
+   | `/shortened/QUOTA_MB`, `/shortened/MAX_USERS` | String, optional |
+
+   Use the default `aws/ssm` key. Its key policy already lets the instance
+   decrypt through SSM. Don't set `PORT`, `DB_PATH`, `TLS_*`, `COOKIE_SECURE`
+   or `TRUST_PROXY` here: the service sets them.
+4. **Activate the `Project` cost allocation tag** in Billing, so the $5 budget
+   (Prompt 7) can filter on it.
+
+## Deploy
+
+Use a change set, so you see the full list of changes before anything is
+created:
+
+1. `CreateChangeSet`: stack name `shortened`, `ChangeSetType=CREATE`, the body
+   of `shortened.yaml` (over 51,200 bytes needs `TemplateURL`; this file is
+   about 14 KB), `Capabilities=[CAPABILITY_NAMED_IAM]` (the role and profile
+   have fixed names), and `Tags=[{Key=Project,Value=shortened}]`. Stack tags reach every resource that
+   supports tags. DNS records, attachments and associations can't take tags.
+2. `DescribeChangeSet`: review it.
+3. `ExecuteChangeSet`. Creating the CloudFront distribution takes 5–15 minutes.
+4. Turn on termination protection for the stack.
+5. Check:
+   - the stack outputs `SiteUrl`, `DistributionDomain`, `InstanceId`, `ElasticIP` and `DataVolumeId`;
+   - the end of `/var/log/shortened-bootstrap.log` (through Session Manager) says `bootstrap done`;
+   - `systemctl status shortened`;
+   - `https://shortened.herzlichkeit-zero.click/` loads, and you can sign up and upload.
+
+## Update
+
+Use the same flow: `CreateChangeSet` with `ChangeSetType=UPDATE`, review,
+then execute.
+
+- **New app version.** UserData runs only at first boot, so changing `AppRef`
+  alone does not rebuild the app. On the instance, through Session Manager:
+  `cd /opt/shortened-src && git fetch --depth 1 origin <ref> && git checkout FETCH_HEAD && docker build -t shortened . && systemctl restart shortened`.
+- **Check whether the instance will be replaced.** `ImageId` is an SSM
+  parameter, so every update resolves it again. When Amazon has published a
+  new AL2023 AMI, the change set shows `Server` with `Replacement: True`.
+  Replacing the instance replaces `DataVolumeAttachment`. The new attachment
+  can fail while the old instance still holds the volume. If it fails, the
+  stack rolls back and the data is safe. To take a new AMI on purpose:
+  1. Stop the old instance, or detach the volume, before you execute.
+  2. Expect a short outage.
+  3. The data volume is reused, never formatted again: `mkfs` runs only on a blank disk.
+  If you don't want a new AMI, override `ImageId` with the current AMI ID.
+
+## Delete
+
+`DeleteStack` (turn termination protection off first). Ask first: this
+removes the instance, its root disk and the Elastic IP.
+
+| Survives a delete | Gone |
+| --- | --- |
+| **Snapshot of the data volume** (accounts, sessions, quota ledger). `DeletionPolicy: Snapshot`; about 8 GB at most, ≤ $0.40/month until you delete it. | Instance and root disk |
+| B2 bucket and all shared files | Elastic IP (released; the address is not kept) |
+| ACM certificate and its validation CNAME | Security group, role, instance profile |
+| SSM parameters `/shortened/*` | CloudFront distribution |
+| Hosted zones and every record the stack didn't create | `shortened` A and AAAA records |
+| `shortened-boundary` policy | the data volume itself (after the snapshot) |
+
+To restore, create a volume from the snapshot in the same AZ. Then deploy
+with the template changed to use that volume, or copy
+`/data/shortened.db` from it.
+
+## Cost (us-east-1, from the Price List API on 2026-11-01)
+
+Running 24/7 (730 h), prices before tax:
+
+| Item | Until 2026-12-31 (t4g.small trial) | From 2027 |
+| --- | --- | --- |
+| t4g.small, 730 h, standard credits | $0.00 | $12.26 |
+| 8 GiB gp3 root | $0.64 | $0.64 |
+| 8 GiB gp3 data | $0.64 | $0.64 |
+| Public IPv4 (EIP), 730 h | $3.65 | $3.65 |
+| Route 53, 2 hosted zones (already exist) | $1.00 | $1.00 |
+| Snapshots, up to 8 GB | ≤ $0.40 | ≤ $0.40 |
+| CloudFront (under the free 1 TB and 10 M requests) | $0.00 | $0.00 |
+| **Total** | **≈ $6.33** | **≈ $18.59** |
+
+Unit prices: t4g.small $0.0168/h, gp3 $0.08/GB-month, snapshot $0.05/GB-month,
+IPv4 $0.005/h, hosted zone $0.50/month.
+
+**The $5/month budget will be exceeded.** Excluding the hosted zones, which
+cost the same with or without this stack, the stack itself costs about $5.33
+until 2026-12-31 and about $17.59 from 2027. Expect budget alerts every
+month unless the limit goes up.
+
+Not included:
+- the Cutie volume (≈ $1.60/month);
+- App Runner charges;
+- the yearly `.click` renewal;
+- DNS query charges, which are negligible (alias queries to CloudFront are free).
