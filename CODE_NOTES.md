@@ -31,10 +31,12 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | `POST /auth/login` | none, rate-limited | Same body → `200`, sets the session cookie. |
 | `POST /auth/logout` | cookie | Ends this session → `204`. |
 | `GET /auth/me` | cookie | `{"username","usedBytes","quotaBytes"}`. |
-| `POST /upload-url` | cookie | `{"filename","size"}` → `{"key","url"}`, a presigned PUT. |
-| `GET /files` | cookie | The user's own files, newest first: `[{"key","name","size","lastModified"}]`. |
+| `POST /upload-url` | cookie | `{"filename","size","onConflict"}` → `{"key","url","name"}`, a presigned PUT. `onConflict` is `""` (ask), `"replace"` or `"keepboth"`. A name in use with `""` gets `409 {"error","conflict":true,"name","suggestion"}`; a name with an upload still in flight gets `409 {"error"}`; a refused name gets `400`; no room gets `413`. |
+| `POST /files/confirm?key=` | cookie | After a successful PUT. HEADs the object, records its real size, finishes a Replace → `{"usedBytes","quotaBytes"}`. No object → `404`, and the reservation is dropped. |
+| `POST /files/release?key=` | cookie | After a failed or cancelled PUT. Drops the reservation at once (or confirms it, if the object did land) → `{"usedBytes","quotaBytes"}`. Never drops a confirmed file. |
+| `GET /files` | cookie | The user's own files, newest first: `[{"key","name","size","lastModified"}]`. Reconciles the ledger with the bucket. |
 | `DELETE /files?key=` | cookie | Deletes one of the user's own files → `204`. |
-| `GET /download-url?key=` | cookie | `{"url"}`, a presigned GET that downloads as an attachment. |
+| `GET /download-url?key=` | cookie | HEADs the object first. Present → `{"url"}`, a presigned GET that downloads as an attachment. Missing → `404 "this file is no longer in storage"`, and its ledger row goes. Storage unreachable → `502`. |
 
 Errors are always `{"error": "..."}`. A missing or expired session gets `401`.
 Someone else's key gets `404`, the same as a missing file.
@@ -45,13 +47,17 @@ Someone else's key gets `404`, the same as a missing file.
 browser --POST /auth/login {username,password}--> server: bcrypt check, new session
 server  --Set-Cookie: session=<random>; HttpOnly; Secure; SameSite=Lax--> browser
 
-browser --POST /upload-url {filename,size} + cookie--> server
-server: session -> user; size <= 50 MB; clean name;
-        key = u/<user id>/<16 hex>-<name>
-        list u/<id>/ in B2 and reconcile the ledger; used + size <= quota?
-        reserve the size in the ledger; sign a PUT for that key and exact
-        Content-Length, valid 10 minutes
-server --{"key","url"}--> browser --PUT bytes--> B2 (never through the server)
+browser --POST /upload-url {filename,size,onConflict} + cookie--> server
+server: session -> user; size <= 50 MB; check the name;
+        list u/<id>/ in B2 and reconcile the ledger;
+        name in use? -> 409 (ask), or Keep both / Replace;
+        used (- the replaced file) + size <= quota?
+        reserve the size in the ledger; key = u/<user id>/<16 hex>-<name>;
+        sign a PUT for that key and exact Content-Length, valid 10 minutes
+server --{"key","url","name"}--> browser --PUT bytes--> B2 (never through the server)
+browser --POST /files/confirm (PUT ok) or /files/release (PUT failed/cancelled)--> server
+server: HEAD the object; confirm the row with its real size, or drop it;
+        a confirmed Replace deletes the old file -> {"usedBytes","quotaBytes"}
 ```
 
 ## Why these choices
@@ -101,11 +107,43 @@ keys of exactly that shape inside the caller's own prefix, and anything else
 gets `404`.
 
 **The quota ledger.** The `files` table records the declared size as soon as
-an upload URL is signed, so ten links requested at once can't exceed the quota.
-Every listing, and every new upload request, reconciles the table with the
-bucket. Real objects get their real size. Reservations whose upload never
-arrived are dropped once they are older than the link lifetime plus 15
-minutes.
+an upload URL is signed, so ten links requested at once can't exceed the quota
+(the single connection serializes them). A row is a reservation until
+`confirmed_at` is set, and then a stored file:
+
+- after a successful PUT the page calls `/files/confirm`; the server HEADs the
+  object and records its real size;
+- after a failed or cancelled PUT the page calls `/files/release`, and the
+  reservation goes at once; if the bytes landed anyway, it is confirmed;
+- a reservation nobody confirms or releases (tab closed) is dropped once it is
+  older than the link lifetime plus 15 minutes, as before;
+- every listing (the page lists on load) and every upload request reconciles
+  the table with the bucket: objects get a confirmed row with their real
+  size, and a confirmed row whose object is gone (deleted in B2 by other means)
+  goes at once. A row confirmed in the same second the listing started is
+  left for the next listing, since the listing may have begun before its PUT;
+- a download HEADs the object, and a missing one leaves the ledger then.
+
+Databases from before this gain `confirmed_at` and `replaces` on open
+(`migrateFilesColumns`, logged as `migration: files table gained ...`). Old
+rows start unconfirmed and are confirmed by the first listing that sees them.
+
+**File names.** New uploads may use only `A-Z a-z 0-9 . _ -`, up to 120
+bytes, with at least one letter or digit. Spaces become `-`; anything else is
+refused with a message naming the characters, by the page before asking and
+by the server with `400` (`checkFilename`). Names stored under the old rule
+stay as they are; they already fit the key pattern.
+
+**Same name.** A name is in use if one of the user's stored files has it. The
+server answers `409` with what Keep both would store (`<name>-<n>.<ext>`, the
+smallest free `n`, `freeName`), and the page asks Replace / Keep both / Cancel.
+The check runs in the reserving transaction, so two tabs can't both claim a
+name: while one upload of a name is in flight, another gets `409` "still in
+progress". Replace reserves under a new key with `replaces` naming the old
+one, and the old file's size doesn't count for the quota check. When the new
+upload is confirmed (or a listing sees it), the old file is deleted, every
+version, and its row goes. Until then the old file is untouched, so a failed
+Replace loses nothing.
 
 **The upload size is signed.** The declared size goes into the presigned PUT
 as `Content-Length`, so B2 refuses a body of any other size. That makes both
@@ -292,6 +330,28 @@ a 120-character file name:
 This check found and fixed a real bug. The panel column was a CSS grid item
 with the default `min-width: auto`, so one long file name widened the page
 past the screen. It is now `grid-template-columns: minmax(0, 1fr)`.
+
+**Usage and uploads (v2 Prompt 9)**, on 2026-11-04, local server against the
+dev bucket, test users in `u/9001/` and up (an id sequence seeded past the
+folders already in use), all files removed afterwards:
+
+- `go test ./...`, `go vet`, gofmt, staticcheck, gosec, html-validate clean.
+  The new tests in `api/ledger_test.go` cover confirm, release after a failed
+  PUT, release after a cancelled PUT whose bytes landed, an object deleted in
+  B2 behind the app (listing and download), ten parallel reservations against
+  the quota, ten tabs on one name, conflict / Keep both / Replace, and a
+  Replace finished by the listing;
+- the same flows over HTTP with real B2 (29 checks), including a PUT of the
+  wrong size refused with `403` and released at once, and an object removed
+  with `b2 rm` giving `404 "this file is no longer in storage"`;
+- the page in headless Chrome at 1000 and 390 px (28 checks): usage text
+  ("127 KB of 500 MB") after every upload, delete and failure, the
+  Replace / Keep both / Cancel dialog, the name message in the browser, the
+  missing-file message with the page staying put, a PUT blocked by CORS, and
+  Cancel during a throttled upload releasing the reservation. Screenshots are
+  in `.agent/shots/after/`. For the flows that need the PUT to reach B2, that
+  Chrome ran with web security off in a throwaway profile, because the dev
+  bucket's CORS rule doesn't list `http://localhost:8092`, where the test ran.
 
 Not run:
 

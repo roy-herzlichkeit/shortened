@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -28,12 +30,30 @@ const ledgerGrace = linkTTL + 15*time.Minute
 type uploadRequest struct {
 	Filename string `json:"filename"`
 	Size     int64  `json:"size"`
+	// OnConflict says what to do when a file of the same name exists: ""
+	// (ask: answer 409), "replace" or "keepboth".
+	OnConflict string `json:"onConflict"`
 }
 
 type uploadResponse struct {
-	Key string `json:"key"`
-	URL string `json:"url"`
+	Key  string `json:"key"`
+	URL  string `json:"url"`
+	Name string `json:"name"` // the stored name; "Keep both" picks a new one
 }
+
+// conflictResponse is the 409 for a name that is already in use.
+type conflictResponse struct {
+	Error      string `json:"error"`
+	Conflict   bool   `json:"conflict"`
+	Name       string `json:"name"`
+	Suggestion string `json:"suggestion"` // what "Keep both" would store
+}
+
+const (
+	onConflictAsk      = ""
+	onConflictReplace  = "replace"
+	onConflictKeepBoth = "keepboth"
+)
 
 func (s *server) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -57,37 +77,48 @@ func (s *server) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "file is larger than the 50 MB limit")
 		return
 	}
-
-	name := cleanFilename(req.Filename)
-	if name == "" {
-		writeError(w, http.StatusBadRequest, "filename is required")
+	switch req.OnConflict {
+	case onConflictAsk, onConflictReplace, onConflictKeepBoth:
+	default:
+		writeError(w, http.StatusBadRequest, `onConflict must be "", "replace" or "keepboth"`)
 		return
 	}
 
-	id, err := newID()
+	name, err := checkFilename(req.Filename)
 	if err != nil {
-		log.Printf("random id: %v", err)
-		writeError(w, http.StatusInternalServerError, "could not build an object key")
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	key := userPrefix(u.id) + id + "-" + name
 
 	// Bring the ledger up to date first, so abandoned reservations stop
-	// counting, then reserve this upload's size.
+	// counting and the name check sees what is really stored.
 	if _, err := s.syncFiles(r.Context(), u.id); err != nil {
 		log.Printf("sync files for user %d: %v", u.id, err)
 		writeError(w, http.StatusBadGateway, "could not check your storage usage")
 		return
 	}
-	used, ok, err := s.reserve(r.Context(), u.id, key, req.Size)
+	res, err := s.reserve(r.Context(), u.id, name, req.Size, req.OnConflict)
 	if err != nil {
-		log.Printf("reserve %q: %v", key, err)
+		log.Printf("reserve %q for user %d: %v", name, u.id, err)
 		writeError(w, http.StatusInternalServerError, "could not check your storage usage")
 		return
 	}
-	if !ok {
+	switch res.outcome {
+	case reserveNoRoom:
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-			"not enough storage left: %s of %s used", formatMB(used), formatMB(s.cfg.quotaBytes)))
+			"not enough storage left: %s of %s used", formatMB(res.used), formatMB(s.cfg.quotaBytes)))
+		return
+	case reserveConflict:
+		writeJSON(w, http.StatusConflict, conflictResponse{
+			Error:      fmt.Sprintf("you already have a file named %s", name),
+			Conflict:   true,
+			Name:       name,
+			Suggestion: res.name,
+		})
+		return
+	case reserveBusy:
+		writeError(w, http.StatusConflict, fmt.Sprintf(
+			"another upload of %s is still in progress; wait for it to finish", name))
 		return
 	}
 
@@ -96,43 +127,146 @@ func (s *server) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 	// exactly the size it reserved, and only until the link goes stale.
 	signed, err := s.presign.PresignPutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:        aws.String(s.cfg.bucket),
-		Key:           aws.String(key),
+		Key:           aws.String(res.key),
 		ContentLength: aws.Int64(req.Size),
 	}, s3.WithPresignExpires(linkTTL))
 	if err != nil {
-		log.Printf("presign put %q: %v", key, err)
-		if _, err := s.db.ExecContext(r.Context(), `DELETE FROM files WHERE key = ?`, key); err != nil {
-			log.Printf("release reservation %q: %v", key, err)
+		log.Printf("presign put %q: %v", res.key, err)
+		if _, err := s.db.ExecContext(r.Context(), `DELETE FROM files WHERE key = ?`, res.key); err != nil {
+			log.Printf("release reservation %q: %v", res.key, err)
 		}
 		writeError(w, http.StatusBadGateway, "could not sign the upload URL")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, uploadResponse{Key: key, URL: signed.URL})
+	writeJSON(w, http.StatusOK, uploadResponse{Key: res.key, URL: signed.URL, Name: res.name})
 }
 
-// reserve records an upload of size bytes against the user's quota, or
-// reports false with the current usage when it would not fit.
-func (s *server) reserve(ctx context.Context, userID int64, key string, size int64) (int64, bool, error) {
+type reserveOutcome int
+
+const (
+	reserveOK       reserveOutcome = iota
+	reserveNoRoom                  // over quota
+	reserveConflict                // the name is taken and the caller hasn't chosen
+	reserveBusy                    // an unfinished upload already uses the name
+)
+
+type reservation struct {
+	outcome reserveOutcome
+	key     string // the new object's key (reserveOK)
+	name    string // the stored name (reserveOK), or the "Keep both" name (reserveConflict)
+	used    int64  // usage before this upload (reserveNoRoom)
+}
+
+// reserve records an upload of size bytes against the user's quota. The name
+// check runs in the same transaction, so two tabs can't both claim a name:
+// the single database connection serializes them.
+//
+//   - A name in use by a stored file: with onConflict "" it reports
+//     reserveConflict and the "Keep both" name; "keepboth" stores under that
+//     name; "replace" records the stored file in the new row's replaces column,
+//     and its size doesn't count against the quota for this check, since it
+//     goes once the new upload is confirmed.
+//   - A name in use by an upload that hasn't been confirmed: "keepboth" picks
+//     a free name, anything else reports reserveBusy.
+func (s *server) reserve(ctx context.Context, userID int64, name string, size int64, onConflict string) (reservation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, false, err
+		return reservation{}, err
 	}
 	defer tx.Rollback()
 
-	used, err := s.usedBytes(ctx, tx, userID)
+	type row struct {
+		key       string
+		size      int64
+		confirmed bool
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT key, size, confirmed_at FROM files WHERE user_id = ?`, userID)
 	if err != nil {
-		return 0, false, err
+		return reservation{}, err
 	}
-	if used+size > s.cfg.quotaBytes {
-		return used, false, nil
+	taken := map[string]bool{}
+	var stored, pending *row
+	var used int64
+	for rows.Next() {
+		var rw row
+		var confirmedAt int64
+		if err := rows.Scan(&rw.key, &rw.size, &confirmedAt); err != nil {
+			_ = rows.Close()
+			return reservation{}, err
+		}
+		rw.confirmed = confirmedAt > 0
+		used += rw.size
+		n := displayName(rw.key)
+		taken[n] = true
+		if n == name {
+			if rw.confirmed {
+				stored = &rw
+			} else {
+				pending = &rw
+			}
+		}
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return reservation{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return reservation{}, err
+	}
+
+	var replaces string
+	var credit int64
+	if stored != nil || pending != nil {
+		switch {
+		case onConflict == onConflictKeepBoth:
+			name = freeName(name, taken)
+		case pending != nil:
+			return reservation{outcome: reserveBusy}, nil
+		case onConflict == onConflictReplace:
+			replaces, credit = stored.key, stored.size
+		default:
+			return reservation{outcome: reserveConflict, name: freeName(name, taken)}, nil
+		}
+	}
+
+	if used-credit+size > s.cfg.quotaBytes {
+		return reservation{outcome: reserveNoRoom, used: used}, nil
+	}
+
+	id, err := newID()
+	if err != nil {
+		return reservation{}, fmt.Errorf("random id: %w", err)
+	}
+	key := userPrefix(userID) + id + "-" + name
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO files (key, user_id, size, created_at) VALUES (?, ?, ?, ?)`,
-		key, userID, size, time.Now().Unix()); err != nil {
-		return 0, false, err
+		`INSERT INTO files (key, user_id, size, created_at, replaces) VALUES (?, ?, ?, ?, ?)`,
+		key, userID, size, time.Now().Unix(), replaces); err != nil {
+		return reservation{}, err
 	}
-	return used, true, tx.Commit()
+	return reservation{outcome: reserveOK, key: key, name: name}, tx.Commit()
+}
+
+// freeName returns "<base>-<n><ext>" for the smallest n >= 1 not in taken,
+// shortening the base if the result would pass maxNameLen.
+func freeName(name string, taken map[string]bool) string {
+	ext := path.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	// ".env" has no base, and a very long "extension" isn't one: number the
+	// whole name instead.
+	if base == "" || len(ext) > 16 {
+		base, ext = name, ""
+	}
+	for n := 1; ; n++ {
+		suffix := "-" + strconv.Itoa(n) + ext
+		b := base
+		if len(b)+len(suffix) > maxNameLen {
+			b = b[:maxNameLen-len(suffix)]
+		}
+		if candidate := b + suffix; !taken[candidate] {
+			return candidate
+		}
+	}
 }
 
 type rowQuerier interface {
@@ -159,9 +293,16 @@ type bucketObject struct {
 }
 
 // syncFiles lists the user's objects in the bucket and makes the ledger agree:
-// objects get a row with their real size, and rows whose upload never arrived
-// are dropped once their reservation has lapsed.
+//   - every object gets a row with its real size, marked confirmed;
+//   - a confirmed row with no object (deleted in the bucket by other means)
+//     goes at once, unless it was confirmed after this listing started;
+//   - an unconfirmed row with no object goes once its reservation has lapsed;
+//   - a "Replace" upload that has landed removes the file it replaces, in
+//     case the browser never got to confirm it.
 func (s *server) syncFiles(ctx context.Context, userID int64) ([]bucketObject, error) {
+	// A row confirmed while this listing ran may be missing from it; only rows
+	// confirmed before the listing started are judged by it.
+	listStart := time.Now().Unix()
 	var objects []bucketObject
 	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.cfg.bucket),
@@ -192,14 +333,15 @@ func (s *server) syncFiles(ctx context.Context, userID int64) ([]bucketObject, e
 	for _, o := range objects {
 		present[o.key] = true
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO files (key, user_id, size, created_at) VALUES (?, ?, ?, ?)
-			ON CONFLICT(key) DO UPDATE SET size = excluded.size`,
-			o.key, userID, o.size, now); err != nil {
+			INSERT INTO files (key, user_id, size, created_at, confirmed_at) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET size = excluded.size,
+				confirmed_at = CASE WHEN files.confirmed_at = 0 THEN excluded.confirmed_at ELSE files.confirmed_at END`,
+			o.key, userID, o.size, now, now); err != nil {
 			return nil, err
 		}
 	}
 
-	stale, err := staleKeys(ctx, tx, userID, present)
+	stale, replaced, err := ledgerChanges(ctx, tx, userID, present, listStart)
 	if err != nil {
 		return nil, err
 	}
@@ -208,31 +350,57 @@ func (s *server) syncFiles(ctx context.Context, userID int64) ([]bucketObject, e
 			return nil, err
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 
-	return objects, tx.Commit()
+	// Finish "Replace" uploads whose new object is in the bucket. Outside the
+	// transaction: it talks to the bucket, and it uses s.db itself.
+	gone := map[string]bool{}
+	for newKey, oldKey := range replaced {
+		if err := s.finishReplace(ctx, userID, newKey, oldKey); err != nil {
+			log.Printf("finish replace %q -> %q: %v", oldKey, newKey, err)
+			continue
+		}
+		gone[oldKey] = true
+	}
+	if len(gone) > 0 {
+		objects = slices.DeleteFunc(objects, func(o bucketObject) bool { return gone[o.key] })
+	}
+	return objects, nil
 }
 
-// staleKeys returns the user's ledger rows that are past their reservation
-// window and have no object in the bucket.
-func staleKeys(ctx context.Context, tx *sql.Tx, userID int64, present map[string]bool) ([]string, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT key FROM files WHERE user_id = ? AND created_at < ?`,
-		userID, time.Now().Add(-ledgerGrace).Unix())
+// ledgerChanges reads the user's ledger rows against the bucket listing. It
+// returns the rows to drop (see syncFiles), and the "Replace" uploads whose new
+// object is present, as new key -> key being replaced.
+func ledgerChanges(ctx context.Context, tx *sql.Tx, userID int64, present map[string]bool, listStart int64) ([]string, map[string]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT key, created_at, confirmed_at, replaces FROM files WHERE user_id = ?`, userID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = rows.Close() }() // read-only; rows.Err below reports failures
 
+	lapsed := time.Now().Add(-ledgerGrace).Unix()
 	var stale []string
+	replaced := map[string]string{}
 	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, err
+		var key, replaces string
+		var createdAt, confirmedAt int64
+		if err := rows.Scan(&key, &createdAt, &confirmedAt, &replaces); err != nil {
+			return nil, nil, err
 		}
-		if !present[key] {
-			stale = append(stale, key)
+		switch {
+		case present[key]:
+			if replaces != "" {
+				replaced[key] = replaces
+			}
+		case confirmedAt > 0 && confirmedAt < listStart:
+			stale = append(stale, key) // was stored, isn't any more
+		case confirmedAt == 0 && createdAt < lapsed:
+			stale = append(stale, key) // the upload never arrived
 		}
 	}
-	return stale, rows.Err()
+	return stale, replaced, rows.Err()
 }
 
 func (s *server) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -290,6 +458,189 @@ func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// usageResponse is what confirm and release answer, so the page can redraw the
+// usage bar without another request.
+type usageResponse struct {
+	UsedBytes  int64 `json:"usedBytes"`
+	QuotaBytes int64 `json:"quotaBytes"`
+}
+
+func (s *server) writeUsage(w http.ResponseWriter, r *http.Request, userID int64) {
+	used, err := s.usedBytes(r.Context(), s.db, userID)
+	if err != nil {
+		log.Printf("usage for user %d: %v", userID, err)
+		writeError(w, http.StatusInternalServerError, "could not read your storage usage")
+		return
+	}
+	writeJSON(w, http.StatusOK, usageResponse{UsedBytes: used, QuotaBytes: s.cfg.quotaBytes})
+}
+
+// pendingRow reads the caller's ledger row for key. ok is false when there is
+// none, which a stranger's key also gets.
+func (s *server) pendingRow(ctx context.Context, userID int64, key string) (size, confirmedAt int64, replaces string, ok bool, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT size, confirmed_at, replaces FROM files WHERE key = ? AND user_id = ?`,
+		key, userID).Scan(&size, &confirmedAt, &replaces)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, "", false, nil
+	}
+	return size, confirmedAt, replaces, err == nil, err
+}
+
+// handleConfirm is called by the browser after its PUT to the bucket
+// succeeded: POST /files/confirm?key=. The object must be in the bucket; its
+// real size goes into the ledger and the row counts as stored from now on. For
+// a "Replace" upload, the old file is deleted.
+func (s *server) handleConfirm(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	u := userFrom(r)
+	key, ok := ownKeyParam(w, r)
+	if !ok {
+		return
+	}
+	if _, _, _, found, err := s.pendingRow(r.Context(), u.id, key); err != nil {
+		log.Printf("confirm %q: %v", key, err)
+		writeError(w, http.StatusInternalServerError, "could not read your storage usage")
+		return
+	} else if !found {
+		writeError(w, http.StatusNotFound, "no upload is waiting for this file")
+		return
+	}
+
+	size, err := s.headObject(r.Context(), key)
+	switch {
+	case errors.Is(err, errNotInBucket):
+		if _, err := s.db.ExecContext(r.Context(), `DELETE FROM files WHERE key = ? AND confirmed_at = 0`, key); err != nil {
+			log.Printf("drop unconfirmed %q: %v", key, err)
+		}
+		writeError(w, http.StatusNotFound, "the upload didn't reach storage; try again")
+		return
+	case err != nil:
+		log.Printf("confirm head %q: %v", key, err)
+		writeError(w, http.StatusBadGateway, "could not reach storage to check the upload")
+		return
+	}
+
+	if err := s.markConfirmed(r.Context(), u.id, key, size); err != nil {
+		log.Printf("confirm %q: %v", key, err)
+		writeError(w, http.StatusInternalServerError, "could not record the upload")
+		return
+	}
+	s.writeUsage(w, r, u.id)
+}
+
+// markConfirmed records the object's real size, marks the row stored, and
+// finishes a "Replace" upload. A replace that fails here is retried by the
+// next listing.
+func (s *server) markConfirmed(ctx context.Context, userID int64, key string, size int64) error {
+	reserved, _, replaces, found, err := s.pendingRow(ctx, userID, key)
+	if err != nil || !found {
+		return err
+	}
+	if size != reserved {
+		// The signed Content-Length makes this impossible through the app.
+		log.Printf("confirm %q: stored %d bytes, reserved %d", key, size, reserved)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE files SET size = ?,
+			confirmed_at = CASE WHEN confirmed_at = 0 THEN ? ELSE confirmed_at END
+		WHERE key = ?`, size, time.Now().Unix(), key); err != nil {
+		return err
+	}
+	if replaces != "" {
+		if err := s.finishReplace(ctx, userID, key, replaces); err != nil {
+			log.Printf("finish replace %q -> %q: %v", replaces, key, err)
+		}
+	}
+	return nil
+}
+
+// finishReplace deletes the file a "Replace" upload swapped out, every
+// version, and its ledger row, then clears the new row's replaces column.
+func (s *server) finishReplace(ctx context.Context, userID int64, newKey, oldKey string) error {
+	if !validKey(oldKey) || !strings.HasPrefix(oldKey, userPrefix(userID)) {
+		return fmt.Errorf("refusing to replace %q: not one of this user's keys", oldKey)
+	}
+	if err := s.deleteAllVersions(ctx, oldKey); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM files WHERE key = ?`, oldKey); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE files SET replaces = '' WHERE key = ?`, newKey)
+	return err
+}
+
+// handleRelease is called by the browser when its PUT failed or was cancelled:
+// POST /files/release?key=. The reservation goes at once, unless the object
+// did reach the bucket after all, in which case the upload is confirmed so the
+// ledger still matches the bucket.
+func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	u := userFrom(r)
+	key, ok := ownKeyParam(w, r)
+	if !ok {
+		return
+	}
+	_, confirmedAt, _, found, err := s.pendingRow(r.Context(), u.id, key)
+	if err != nil {
+		log.Printf("release %q: %v", key, err)
+		writeError(w, http.StatusInternalServerError, "could not read your storage usage")
+		return
+	}
+	if !found || confirmedAt > 0 {
+		// Nothing reserved, or already a stored file: releasing must never
+		// drop a real file from the ledger.
+		s.writeUsage(w, r, u.id)
+		return
+	}
+
+	size, err := s.headObject(r.Context(), key)
+	switch {
+	case err == nil:
+		err = s.markConfirmed(r.Context(), u.id, key, size)
+	default:
+		// Not in the bucket, or the bucket can't be asked: drop the
+		// reservation. If the object does exist, the next listing adds it back.
+		if !errors.Is(err, errNotInBucket) {
+			log.Printf("release head %q: %v", key, err)
+		}
+		_, err = s.db.ExecContext(r.Context(), `DELETE FROM files WHERE key = ? AND confirmed_at = 0`, key)
+	}
+	if err != nil {
+		log.Printf("release %q: %v", key, err)
+		writeError(w, http.StatusInternalServerError, "could not update your storage usage")
+		return
+	}
+	s.writeUsage(w, r, u.id)
+}
+
+var errNotInBucket = errors.New("object not in bucket")
+
+// headObject returns the object's size, or errNotInBucket if there is no
+// visible object (B2 answers 404 for a hidden file too).
+func (s *server) headObject(ctx context.Context, key string) (int64, error) {
+	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.cfg.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		var re *awshttp.ResponseError
+		if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotFound {
+			return 0, errNotInBucket
+		}
+		return 0, err
+	}
+	return aws.ToInt64(out.ContentLength), nil
 }
 
 // deleteAllVersions removes every stored version of key, and any hide markers.
@@ -353,6 +704,21 @@ func (s *server) handleDownloadURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A signed link to a missing object would only show B2's error page, so
+	// check first. A file that is gone also leaves the ledger at once.
+	switch _, err := s.headObject(r.Context(), key); {
+	case errors.Is(err, errNotInBucket):
+		if _, err := s.db.ExecContext(r.Context(), `DELETE FROM files WHERE key = ?`, key); err != nil {
+			log.Printf("drop missing %q: %v", key, err)
+		}
+		writeError(w, http.StatusNotFound, "this file is no longer in storage")
+		return
+	case err != nil:
+		log.Printf("download head %q: %v", key, err)
+		writeError(w, http.StatusBadGateway, "could not reach storage to check the file; try again")
+		return
+	}
+
 	// Forcing an attachment keeps an uploaded HTML or SVG file from rendering
 	// in the browser on the bucket's origin. The name is already restricted to
 	// [A-Za-z0-9._-], so it needs no quoting beyond the surrounding quotes.
@@ -391,8 +757,7 @@ func ownKeyParam(w http.ResponseWriter, r *http.Request) (string, bool) {
 }
 
 var (
-	unsafeNameChars = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
-	keyPattern      = regexp.MustCompile(`^u/[1-9][0-9]{0,18}/[0-9a-f]{16}-[A-Za-z0-9._-]{1,120}$`)
+	keyPattern = regexp.MustCompile(`^u/[1-9][0-9]{0,18}/[0-9a-f]{16}-[A-Za-z0-9._-]{1,120}$`)
 )
 
 // userPrefix is the folder in the bucket that holds one user's files.
@@ -401,7 +766,7 @@ func userPrefix(userID int64) string {
 }
 
 // validKey reports whether key looks like one this API issued: a user folder,
-// a random hex prefix and a name that cleanFilename could have produced.
+// a random hex prefix and a name of the allowed characters.
 func validKey(key string) bool {
 	return keyPattern.MatchString(key)
 }
@@ -417,27 +782,44 @@ func displayName(key string) string {
 	return base[idLen+1:]
 }
 
-// cleanFilename turns a client-supplied name into a flat, harmless object-key
-// suffix: no directories, no control characters, no characters that would need
-// escaping in a URL, and a bounded length that keeps the extension.
-func cleanFilename(name string) string {
-	name = strings.ReplaceAll(name, `\`, "/")
-	name = path.Base(name)
-	name = unsafeNameChars.ReplaceAllString(name, "-")
-	name = strings.Trim(name, "-._")
-
-	if len(name) > maxNameLen {
-		ext := path.Ext(name)
-		if len(ext) > 16 {
-			ext = ""
-		}
-		base := strings.TrimSuffix(name, ext)
-		if room := maxNameLen - len(ext); len(base) > room {
-			base = base[:room]
-		}
-		name = strings.Trim(base, "-._") + ext
+// checkFilename checks a name the browser sent for a new upload. Spaces become
+// "-"; every other character must be one of A-Z a-z 0-9 . _ -, and the name
+// needs at least one letter or digit. Names stored before this rule keep
+// their old form; it applies to new uploads only.
+func checkFilename(name string) (string, error) {
+	name = strings.ReplaceAll(name, " ", "-")
+	if name == "" {
+		return "", errors.New("the file needs a name")
 	}
-	return name
+	if bad := badNameChars(name); bad != "" {
+		return "", fmt.Errorf("file names may use only letters, digits, dot, underscore and dash; rename the file to remove %s", bad)
+	}
+	if len(name) > maxNameLen {
+		return "", fmt.Errorf("file name is longer than %d characters", maxNameLen)
+	}
+	if !strings.ContainsFunc(name, func(r rune) bool { return nameAlnum(r) }) {
+		return "", errors.New("file name needs at least one letter or digit")
+	}
+	return name, nil
+}
+
+// badNameChars lists, once each and quoted, the characters checkFilename
+// refuses, or "" if there are none.
+func badNameChars(name string) string {
+	seen := map[rune]bool{}
+	var out []string
+	for _, r := range name {
+		if nameAlnum(r) || r == '.' || r == '_' || r == '-' || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, strconv.QuoteRune(r))
+	}
+	return strings.Join(out, " ")
+}
+
+func nameAlnum(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
 }
 
 func newID() (string, error) {

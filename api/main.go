@@ -163,6 +163,8 @@ func (s *server) routes() http.Handler {
 
 	mux.Handle("/upload-url", noStore(s.requireUser(s.handleUploadURL)))
 	mux.Handle("/files", noStore(s.requireUser(s.handleFiles)))
+	mux.Handle("/files/confirm", noStore(s.requireUser(s.handleConfirm)))
+	mux.Handle("/files/release", noStore(s.requireUser(s.handleRelease)))
 	mux.Handle("/download-url", noStore(s.requireUser(s.handleDownloadURL)))
 
 	mux.Handle("/", s.pageHandler())
