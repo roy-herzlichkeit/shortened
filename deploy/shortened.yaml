@@ -124,6 +124,9 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # CloudWatch agent (monitoring.yaml): metrics, logs, and its config
+        # from SSM AmazonCloudWatch-*.
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       Policies:
         - PolicyName: shortened-runtime
           PolicyDocument:

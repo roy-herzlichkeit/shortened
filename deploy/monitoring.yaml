@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Monitoring for SHORTENED.: SNS e-mail alerts, EC2 and CloudFront alarms, the
+  CloudWatch agent (memory, disk, app journal) and a monthly budget. Deploy
+  after the main stack has CloudWatchAgentServerPolicy on its instance role.
+
+Parameters:
+  AlertEmail:
+    Type: String
+    AllowedPattern: ^[^@\s]+@[^@\s]+\.[^@\s]+$
+    Description: Gets the alarm and budget mails. Confirm the SNS subscription mail once.
+  InstanceId:
+    Type: AWS::EC2::Instance::Id
+    Default: i-00a930f6c22e7b35e
+    Description: The InstanceId output of the shortened stack. Update it after an AMI upgrade.
+  DistributionId:
+    Type: String
+    Default: E2PW982OJ38G5Q
+  CpuCreditLow:
+    Type: Number
+    Default: 50
+    Description: Alarm below this many CPU credits (a t4g.small earns 24 per hour, holds at most 576).
+  CreateBudget:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: false if a budget for this project already exists.
+  BudgetUsd:
+    Type: Number
+    Default: 10
+
+Conditions:
+  MakeBudget: !Equals [!Ref CreateBudget, "true"]
+
+Resources:
+  # ---------- Alerts ----------
+
+  Alerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: shortened-alerts
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref AlertEmail }
+      Tags:
+        - { Key: Project, Value: shortened }
+
+  # ---------- Alarms ----------
+
+  # The host under the instance failed. The recover action moves the instance to
+  # healthy hardware and keeps its ID, Elastic IP and EBS volumes.
+  SystemCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: shortened-system-check
+      AlarmDescription: EC2 system status check failed. Recovering the instance.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions: [{ Name: InstanceId, Value: !Ref InstanceId }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Sub arn:aws:automate:${AWS::Region}:ec2:recover
+        - !Ref Alerts
+      OKActions: [!Ref Alerts]
+      Tags:
+        - { Key: Project, Value: shortened }
+
+  InstanceCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: shortened-instance-check
+      AlarmDescription: EC2 instance status check failed (the OS is not answering). Check it through SSM, or reboot it.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Dimensions: [{ Name: InstanceId, Value: !Ref InstanceId }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+      Tags:
+        - { Key: Project, Value: shortened }
+
+  # Standard credits: at 0 the CPU is held to the 20 % baseline (the site slows
+  # down; it is never billed extra).
+  CpuCreditAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: shortened-cpu-credits-low
+      AlarmDescription: CPU credit balance is low. At 0 the instance is throttled to its baseline.
+      Namespace: AWS/EC2
+      MetricName: CPUCreditBalance
+      Dimensions: [{ Name: InstanceId, Value: !Ref InstanceId }]
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref CpuCreditLow
+      ComparisonOperator: LessThanThreshold
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+      Tags:
+        - { Key: Project, Value: shortened }
+
+  # CloudFront metrics live in us-east-1 with Region=Global. Without traffic
+  # there is no data, which counts as fine.
+  CloudFront5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: shortened-cloudfront-5xx
+      AlarmDescription: More than 10 % of CloudFront responses are 5xx (origin down, certificate or app error).
+      Namespace: AWS/CloudFront
+      MetricName: 5xxErrorRate
+      Dimensions:
+        - { Name: DistributionId, Value: !Ref DistributionId }
+        - { Name: Region, Value: Global }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref Alerts]
+      OKActions: [!Ref Alerts]
+      Tags:
+        - { Key: Project, Value: shortened }
+
+  # ---------- CloudWatch agent ----------
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /shortened/app
+      RetentionInDays: 14
+      Tags:
+        - { Key: Project, Value: shortened }
+
+  # CloudWatchAgentServerPolicy lets the agent read SSM AmazonCloudWatch-*.
+  # Metrics every 5 minutes: memory, and disk used on / and /data.
+  AgentConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: AmazonCloudWatch-shortened
+      Type: String
+      Description: CloudWatch agent config for the SHORTENED. instance.
+      Tags: { Project: shortened }
+      Value: |
+        {
+          "agent": { "metrics_collection_interval": 300, "run_as_user": "root" },
+          "metrics": {
+            "namespace": "CWAgent",
+            "append_dimensions": { "InstanceId": "${aws:InstanceId}" },
+            "metrics_collected": {
+              "mem": { "measurement": ["mem_used_percent"] },
+              "disk": { "measurement": ["used_percent"], "resources": ["/", "/data"], "drop_device": true }
+            }
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/log/shortened/app.log",
+                    "log_group_name": "/shortened/app",
+                    "log_stream_name": "{instance_id}",
+                    "retention_in_days": 14
+                  }
+                ]
+              }
+            }
+          }
+        }
+
+  # The agent reads files, not the journal, so a small service copies the
+  # shortened.service journal to /var/log/shortened/app.log (rotated daily,
+  # 3 kept). Then the agent is installed and started with the config above.
+  # Runs once on create, and again whenever the association changes.
+  AgentSetup:
+    Type: AWS::SSM::Association
+    DependsOn: [AgentConfig, AppLogGroup]
+    Properties:
+      AssociationName: shortened-cloudwatch-agent
+      Name: AWS-RunShellScript
+      Targets:
+        - { Key: InstanceIds, Values: [!Ref InstanceId] }
+      ComplianceSeverity: MEDIUM
+      Parameters:
+        executionTimeout: ["600"]
+        commands:
+          - |
+            set -euo pipefail
+            rpm -q amazon-cloudwatch-agent >/dev/null || dnf install -y -q amazon-cloudwatch-agent
+            rpm -q logrotate >/dev/null || dnf install -y -q logrotate
+            cat >/etc/systemd/system/shortened-journal-export.service <<'EOF'
+            [Unit]
+            Description=Copy the shortened.service journal to /var/log/shortened/app.log
+            After=systemd-journald.service
+            [Service]
+            ExecStartPre=/usr/bin/install -d -m 0750 /var/log/shortened
+            ExecStart=/bin/sh -c 'exec /usr/bin/journalctl -u shortened.service -f -o short-iso --cursor-file=/var/lib/shortened-journal.cursor >>/var/log/shortened/app.log'
+            Restart=always
+            RestartSec=5
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            cat >/etc/logrotate.d/shortened-app <<'EOF'
+            /var/log/shortened/app.log {
+              daily
+              rotate 3
+              compress
+              delaycompress
+              missingok
+              notifempty
+              copytruncate
+            }
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now shortened-journal-export.service logrotate.timer
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c ssm:AmazonCloudWatch-shortened
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+
+  # ---------- Budget ----------
+
+  # Counts only costs tagged Project=shortened, so the "Project" cost
+  # allocation tag must be active in Billing. Until then it reads $0.
+  Budget:
+    Type: AWS::Budgets::Budget
+    Condition: MakeBudget
+    Properties:
+      Budget:
+        BudgetName: shortened-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref BudgetUsd, Unit: USD }
+        CostFilters:
+          TagKeyValue: [user:Project$shortened]
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+      ResourceTags:
+        - { Key: Project, Value: shortened }
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref Alerts
+  AppLogGroup:
+    Value: !Ref AppLogGroup
