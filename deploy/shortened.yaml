@@ -1,0 +1,395 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SHORTENED. on one EC2 t4g.small behind CloudFront, HTTPS end to end. The
+  app runs in Docker, gets its config from SSM /shortened/*, and serves TLS
+  itself with a Let's Encrypt certificate from certbot dns-route53.
+
+Parameters:
+  SiteName:
+    Type: String
+    Default: shortened.herzlichkeit-zero.click
+    Description: The public name. CloudFront serves it; the origin certificate covers it.
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Default: Z004479826BXL8T1YK32V
+    Description: The Route 53 zone that holds SiteName (herzlichkeit-zero.click).
+  CertificateArn:
+    Type: String
+    Default: arn:aws:acm:us-east-1:526660177875:certificate/daae2cd6-d03e-4f83-bd69-dc28e694c3ae
+    Description: ACM certificate in us-east-1 for SiteName, already issued and DNS-validated.
+  CloudFrontPrefixListId:
+    Type: String
+    Default: pl-3b927c52
+    Description: com.amazonaws.global.cloudfront.origin-facing
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0690decafc878c8d0
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-08a9ef09ece775e12
+    Description: A public subnet in AvailabilityZone.
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+    Description: The AZ of SubnetId. The data volume must be created in the same one.
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: >-
+      The latest AL2023 arm64 AMI. Re-resolved on every stack update, so it is
+      used only while PinnedImageId is empty.
+  PinnedImageId:
+    Type: String
+    Default: ""
+    AllowedPattern: ^(ami-[0-9a-f]{8,17})?$
+    Description: >-
+      Leave empty on create. On every update pass the ImageIdInUse output, so a
+      new Amazon AMI does not replace the instance. Change it only to upgrade.
+  AttachDataVolume:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Set false only for step 1 of an AMI upgrade (detaches /data from the old
+      instance). See deploy/README.md.
+  AppRef:
+    Type: String
+    Default: main
+    Description: Branch or tag of github.com/roy-herzlichkeit/shortened to build on the instance.
+  CertbotEmail:
+    Type: String
+    Default: roy.herzlichkeit@gmail.com
+    Description: Let's Encrypt account address, used for expiry warnings.
+
+Rules:
+  NotUsEast1e:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AvailabilityZone, us-east-1e]]
+        AssertDescription: t4g.small is not offered in us-east-1e.
+
+Conditions:
+  UsePinnedImage: !Not [!Equals [!Ref PinnedImageId, ""]]
+  AttachData: !Equals [!Ref AttachDataVolume, "true"]
+
+Resources:
+  # ---------- Network ----------
+
+  OriginSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: shortened-origin
+      GroupDescription: HTTPS from CloudFront only. No SSH; use SSM Session Manager.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: CloudFront origin-facing servers
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+      SecurityGroupEgress:
+        # EC2 rule descriptions allow only a-zA-Z0-9. _-:/()#,@[]+=&;{}!$* (no apostrophe).
+        - Description: Outbound to B2, SSM, dnf, GitHub, Go modules and LetsEncrypt
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - { Key: Name, Value: shortened-origin }
+        - { Key: Project, Value: shortened }
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: shortened }
+        - { Key: Project, Value: shortened }
+
+  ElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      InstanceId: !Ref Server
+
+  # ---------- IAM ----------
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shortened-instance-role
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/shortened-boundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: shortened-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadOwnConfig
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/shortened/*
+              - Sid: CertbotLookup
+                Effect: Allow
+                Action: [route53:ListHostedZones, route53:GetChange]
+                Resource: "*"
+              - Sid: CertbotChallengeOnly
+                Effect: Allow
+                Action: route53:ChangeResourceRecordSets
+                Resource: !Sub arn:aws:route53:::hostedzone/${HostedZoneId}
+                Condition:
+                  ForAllValues:StringEquals:
+                    route53:ChangeResourceRecordSetsNormalizedRecordNames:
+                      - !Sub _acme-challenge.${SiteName}
+                    route53:ChangeResourceRecordSetsRecordTypes: [TXT]
+      Tags:
+        - { Key: Project, Value: shortened }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: shortened-instance-profile
+      Roles: [!Ref InstanceRole]
+
+  # ---------- Instance and data ----------
+
+  # Accounts, sessions and the quota ledger (SQLite) live here, not on the
+  # root disk, so a new AMI can replace the instance without losing them.
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Size: 8
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - { Key: Name, Value: shortened-data }
+        - { Key: Project, Value: shortened }
+
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Condition: AttachData
+    Properties:
+      InstanceId: !Ref Server
+      VolumeId: !Ref DataVolume
+      Device: /dev/sdf
+
+  Server:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !If [UsePinnedImage, !Ref PinnedImageId, !Ref ImageId]
+      InstanceType: t4g.small
+      # Standard credits: never billed for surplus CPU (Unlimited is the default).
+      CreditSpecification: { CPUCredits: standard }
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref OriginSecurityGroup]
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 8
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: shortened }
+        - { Key: Project, Value: shortened }
+      # Bash inside Fn::Sub: ${Name} is a template value, ${!name} a bash one.
+      # Nothing here prints a secret, so there is no set -x.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec >>/var/log/shortened-bootstrap.log 2>&1
+          echo "bootstrap start $(date -u +%FT%TZ)"
+
+          # 1. The data volume. On Nitro it is an NVMe device whose by-id name
+          #    holds the volume ID without the dash; it may attach after boot.
+          dev=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$(echo ${DataVolume} | tr -d -)
+          for _ in $(seq 1 120); do [ -e "$dev" ] && break; sleep 5; done
+          [ -e "$dev" ] || { echo "data volume ${DataVolume} never appeared"; exit 1; }
+          blkid "$dev" >/dev/null || mkfs.xfs "$dev"
+          uuid=$(blkid -s UUID -o value "$dev")
+          mkdir -p /data
+          grep -q "$uuid" /etc/fstab || echo "UUID=$uuid /data xfs defaults,nofail 0 2" >>/etc/fstab
+          mountpoint -q /data || mount /data
+          chown 10001:10001 /data
+
+          # 2. Packages.
+          dnf install -y docker git python3
+          systemctl enable --now docker
+
+          # 3a. Config from SSM, written fresh at every service start.
+          cat >/usr/local/bin/shortened-env <<'EOF'
+          #!/bin/bash
+          # Writes /etc/shortened.env from SSM /shortened/*. Never prints values.
+          set -euo pipefail
+          umask 077
+          tmp=$(mktemp /etc/shortened.env.XXXXXX)
+          aws ssm get-parameters-by-path --region ${AWS::Region} --path /shortened/ \
+            --with-decryption --query 'Parameters[].[Name,Value]' --output text |
+            while IFS=$'\t' read -r name value; do printf '%s=%s\n' "${!name##*/}" "$value"; done >"$tmp"
+          mv "$tmp" /etc/shortened.env
+          EOF
+          chmod 0755 /usr/local/bin/shortened-env
+
+          # 3b. The service. It starts once certbot has delivered a certificate.
+          install -d -m 0750 -o 10001 -g 10001 /etc/shortened/tls
+          cat >/etc/systemd/system/shortened.service <<'EOF'
+          [Unit]
+          Description=SHORTENED.
+          After=docker.service network-online.target
+          Requires=docker.service
+          Wants=network-online.target
+          RequiresMountsFor=/data
+
+          [Service]
+          ExecStartPre=/usr/local/bin/shortened-env
+          ExecStartPre=-/usr/bin/docker rm -f shortened
+          ExecStart=/usr/bin/docker run --rm --name shortened -p 443:8443 \
+            -v /data:/data -v /etc/shortened/tls:/tls:ro --env-file /etc/shortened.env \
+            -e PORT=8443 -e DB_PATH=/data/shortened.db \
+            -e TLS_CERT_FILE=/tls/fullchain.pem -e TLS_KEY_FILE=/tls/privkey.pem \
+            -e COOKIE_SECURE=true -e TRUST_PROXY=true shortened
+          ExecStop=/usr/bin/docker stop shortened
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable shortened.service
+
+          # 4. Build the image here (arm64).
+          rm -rf /opt/shortened-src
+          git clone --depth 1 --branch ${AppRef} https://github.com/roy-herzlichkeit/shortened /opt/shortened-src
+          docker build -t shortened /opt/shortened-src
+
+          # 5. certbot in a venv, DNS-01 through Route 53. The deploy hook hands
+          #    the files to uid 10001 (the container user) and restarts the app.
+          python3 -m venv /opt/certbot
+          /opt/certbot/bin/pip install --quiet --upgrade pip certbot certbot-dns-route53
+          cat >/usr/local/bin/shortened-deploy-hook <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          src=/etc/letsencrypt/live/${SiteName}
+          install -o 10001 -g 10001 -m 0644 "$src/fullchain.pem" /etc/shortened/tls/fullchain.pem
+          install -o 10001 -g 10001 -m 0600 "$src/privkey.pem" /etc/shortened/tls/privkey.pem
+          systemctl restart shortened.service
+          EOF
+          chmod 0755 /usr/local/bin/shortened-deploy-hook
+          cat >/etc/systemd/system/certbot-renew.service <<'EOF'
+          [Unit]
+          Description=Renew the SHORTENED. origin certificate
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/certbot/bin/certbot renew --quiet
+          EOF
+          cat >/etc/systemd/system/certbot-renew.timer <<'EOF'
+          [Unit]
+          Description=certbot renew, twice a day
+          [Timer]
+          OnCalendar=*-*-* 00,12:00:00
+          RandomizedDelaySec=1h
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now certbot-renew.timer
+          /opt/certbot/bin/certbot certonly --non-interactive --agree-tos \
+            -m ${CertbotEmail} --dns-route53 -d ${SiteName} \
+            --deploy-hook /usr/local/bin/shortened-deploy-hook
+
+          echo "bootstrap done $(date -u +%FT%TZ)"
+
+  # ---------- CloudFront and DNS ----------
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: shortened
+        Enabled: true
+        Aliases: [!Ref SiteName]
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        # Includes India; leaves out South America and Australia, the dearest edges.
+        PriceClass: PriceClass_200
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: ec2-origin
+            # The EIP's public DNS name. CloudFront checks the origin
+            # certificate against the forwarded Host (SiteName), which is the
+            # name the Let's Encrypt certificate covers.
+            DomainName: !Sub
+              - ec2-${Dashed}.compute-1.amazonaws.com
+              - Dashed: !Join ["-", !Split [".", !Ref ElasticIP]]
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+        DefaultCacheBehavior:
+          TargetOriginId: ec2-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed CachingDisabled: nothing is cached, whatever the headers say.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed AllViewer: forwards Host, cookies and query strings, so the
+          # app's sameOrigin check sees Host equal to Origin.
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+      Tags:
+        - { Key: Name, Value: shortened }
+        - { Key: Project, Value: shortened }
+
+  SiteRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SiteName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # fixed zone ID for every CloudFront alias
+
+  SiteRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SiteName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+  SiteUrl:
+    Value: !Sub https://${SiteName}
+  DistributionDomain:
+    Value: !GetAtt Distribution.DomainName
+  InstanceId:
+    Value: !Ref Server
+  ElasticIP:
+    Value: !Ref ElasticIP
+  DataVolumeId:
+    Value: !Ref DataVolume
+  ImageIdInUse:
+    Description: Pass this as PinnedImageId on every update.
+    Value: !If [UsePinnedImage, !Ref PinnedImageId, !Ref ImageId]
