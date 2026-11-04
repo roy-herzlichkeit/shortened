@@ -65,7 +65,6 @@ const newPassword = $("new-password");
 const signupActions = $("signup-actions");
 const signupResend = $("signup-resend");
 const signupRestart = $("signup-restart");
-const accountOpen = $("account-open");
 const accountDialog = $("account-dialog");
 const accountClose = $("account-close");
 const accountStatus = $("account-status");
@@ -224,7 +223,7 @@ function showVerify(me) {
   verifyMode = "account";
   showView(verifyView);
   account.hidden = false;
-  accountOpen.hidden = true;
+  whoami.disabled = true; // no settings until the address is confirmed
   whoami.textContent = me.username;
   verifyCode.value = "";
   addressForm.hidden = false;
@@ -249,7 +248,7 @@ function showVerify(me) {
 function showApp(me) {
   showView(appView);
   account.hidden = false;
-  accountOpen.hidden = false;
+  whoami.disabled = false; // the name opens the Account pop-up
   whoami.textContent = me.username;
   renderUsage(me.usedBytes, me.quotaBytes);
   renderAccount(me);
@@ -758,7 +757,7 @@ signupRestart.addEventListener("click", () => {
   backToSignup();
   setStatus("");
 });
-accountOpen.addEventListener("click", openAccount);
+whoami.addEventListener("click", openAccount);
 accountClose.addEventListener("click", closeAccount);
 // A click on the backdrop (outside the panel) closes it too.
 accountDialog.addEventListener("click", (event) => {

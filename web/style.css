@@ -87,6 +87,21 @@ body::after {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The name is a button that opens the Account pop-up. */
+button.account-name {
+  padding: 0;
+  font: inherit;
+  font-size: inherit;
+  font-weight: 700;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+button.account-name:hover:not(:disabled), button.account-name:focus-visible { text-decoration: underline; text-underline-offset: 4px; }
+button.account-name:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+button.account-name:disabled { cursor: default; }
 .topbar .btn-ghost { color: #000; --btn-line: #000; --btn-glow: rgba(0, 0, 0, .5); --btn-focus: var(--red); }
 .topbar .btn-ghost:hover:not(:disabled) { color: var(--yellow); --btn-fill: #000; }
 
