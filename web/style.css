@@ -87,6 +87,21 @@ body::after {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The name is a button that opens the Account pop-up. */
+button.account-name {
+  padding: 0;
+  font: inherit;
+  font-size: inherit;
+  font-weight: 700;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+button.account-name:hover:not(:disabled), button.account-name:focus-visible { text-decoration: underline; text-underline-offset: 4px; }
+button.account-name:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+button.account-name:disabled { cursor: default; }
 .topbar .btn-ghost { color: #000; --btn-line: #000; --btn-glow: rgba(0, 0, 0, .5); --btn-focus: var(--red); }
 .topbar .btn-ghost:hover:not(:disabled) { color: var(--yellow); --btn-fill: #000; }
 
@@ -446,6 +461,14 @@ main {
 .dialog-text { margin: 0 0 18px; font-family: var(--mono); font-size: 14px; overflow-wrap: anywhere; }
 .dialog-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 
+/* Account settings open as a pop-up over the page. */
+.dialog-wide {
+  width: min(520px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+}
+.dialog-wide .status { margin-top: 14px; }
+
 /* ---------- Status and footer ---------- */
 
 .status {
@@ -476,6 +499,10 @@ main {
   .topbar { padding: 10px 16px; }
   .brand { font-size: 20px; }
   .account-label { display: none; }
+  /* Name, Account and Sign out get their own row under the brand. */
+  .topbar { flex-wrap: wrap; gap: 8px; }
+  .account { width: 100%; }
+  .account-name { flex: 1; }
   .frame-inner { padding: 18px 16px; }
   .upload-row .btn { flex: 1 1 100%; }
   .file-actions { width: 100%; }

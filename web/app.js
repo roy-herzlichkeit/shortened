@@ -62,15 +62,27 @@ const emailCode = $("email-code");
 const passwordForm = $("password-form");
 const currentPassword = $("current-password");
 const newPassword = $("new-password");
+const signupActions = $("signup-actions");
+const signupResend = $("signup-resend");
+const signupRestart = $("signup-restart");
+const accountDialog = $("account-dialog");
+const accountClose = $("account-close");
+const accountStatus = $("account-status");
 
 let mode = "login";
+// What the code in the verify view confirms: "signup" (a sign-up waiting for
+// its code, no account yet) or "account" (the address of a signed-in account).
+let verifyMode = "account";
 let quota = { used: 0, total: 0 };
 let currentFiles = [];
 let activeUpload = null; // the XHR of the upload in progress, for Cancel
 
+// While the Account dialog is open, messages go to its own line, since the
+// page's status line is behind the backdrop.
 function setStatus(text, kind) {
-  statusEl.textContent = text;
-  statusEl.className = "status" + (kind ? " " + kind : "");
+  const el = accountDialog.open ? accountStatus : statusEl;
+  el.textContent = text;
+  el.className = "status" + (kind ? " " + kind : "");
 }
 
 class ApiError extends Error {
@@ -114,6 +126,7 @@ function postJSON(path, data) {
 // with needsEmail means the account has no confirmed address yet.
 function handleError(err) {
   if (err instanceof ApiError && err.status === 401) {
+    closeAccount();
     showAuth();
     setStatus(err.message, "error");
     return;
@@ -172,6 +185,29 @@ function showAuth() {
   usernameInput.focus();
 }
 
+// showSignupVerify asks for the code of a sign-up; the account is created
+// when it is right.
+function showSignupVerify(pending) {
+  verifyMode = "signup";
+  showView(verifyView);
+  account.hidden = true;
+  verifyCode.value = "";
+  verifyText.textContent = "We sent a 6-digit code to " + pending.pendingEmail + ". Enter it to create the account " +
+    pending.username + ". No mail? Check spam, or send a new code.";
+  verifyForm.hidden = false;
+  addressForm.hidden = true;
+  signupActions.hidden = false;
+  verifyCode.focus();
+}
+
+// The pending sign-up is gone (expired, or its name was taken meanwhile):
+// back to the sign-up form, keeping what was typed.
+function backToSignup(message) {
+  setMode("signup");
+  showAuth();
+  if (message) setStatus(message, "error");
+}
+
 function showForgot() {
   showView(forgotView);
   account.hidden = true;
@@ -184,10 +220,14 @@ function showForgot() {
 // showVerify asks an account without a confirmed address for its code, or,
 // if no address is waiting (an account from before email), for an address.
 function showVerify(me) {
+  verifyMode = "account";
   showView(verifyView);
   account.hidden = false;
+  whoami.disabled = true; // no settings until the address is confirmed
   whoami.textContent = me.username;
   verifyCode.value = "";
+  addressForm.hidden = false;
+  signupActions.hidden = true;
   if (me.pendingEmail) {
     verifyText.textContent = "We sent a 6-digit code to " + me.pendingEmail +
       ". Enter it to start using your account. No mail? Check spam, or send a new code below.";
@@ -208,9 +248,25 @@ function showVerify(me) {
 function showApp(me) {
   showView(appView);
   account.hidden = false;
+  whoami.disabled = false; // the name opens the Account pop-up
   whoami.textContent = me.username;
   renderUsage(me.usedBytes, me.quotaBytes);
   renderAccount(me);
+}
+
+async function openAccount() {
+  accountStatus.textContent = "";
+  accountStatus.className = "status";
+  accountDialog.showModal();
+  try {
+    renderAccount(await api("/auth/me"));
+  } catch (err) {
+    handleError(err);
+  }
+}
+
+function closeAccount() {
+  if (accountDialog.open) accountDialog.close();
 }
 
 function renderAccount(me) {
@@ -326,8 +382,17 @@ async function start() {
   try {
     me = await api("/auth/me");
   } catch (err) {
+    if (err instanceof ApiError && err.status === 401) {
+      // Not signed in; maybe a sign-up is waiting for its code (after a reload).
+      try {
+        showSignupVerify(await api("/auth/signup/pending"));
+      } catch (_) {
+        showAuth();
+      }
+      return;
+    }
     showAuth();
-    if (!(err instanceof ApiError && err.status === 401)) setStatus(err.message, "error");
+    setStatus(err.message, "error");
     return;
   }
   if (!me.verified) {
@@ -353,9 +418,16 @@ async function submitAuth(event) {
 
   authSubmit.disabled = true;
   try {
-    if (mode === "signup") await postJSON("/auth/signup", { username, password, email });
-    else await postJSON("/auth/login", { username, password });
-    setStatus(mode === "signup" ? "Account created. Check your email for the code." : "Signed in.");
+    if (mode === "signup") {
+      // No account yet: it is created when the mailed code is entered.
+      const pending = await postJSON("/auth/signup", { username, password, email });
+      passwordInput.value = "";
+      showSignupVerify(pending);
+      setStatus("Code sent to " + pending.pendingEmail + ".");
+      return;
+    }
+    await postJSON("/auth/login", { username, password });
+    setStatus("Signed in.");
   } catch (err) {
     setStatus(err.message, "error");
     return;
@@ -381,10 +453,38 @@ async function withButton(form, fn) {
 function submitVerify(event) {
   event.preventDefault();
   withButton(verifyForm, async () => {
-    await postJSON("/auth/email/verify", { code: verifyCode.value.trim() });
-    setStatus("Email confirmed. Jacked in.");
+    const code = verifyCode.value.trim();
+    if (verifyMode === "signup") {
+      try {
+        await postJSON("/auth/signup/verify", { code });
+      } catch (err) {
+        if (err instanceof ApiError && (err.status === 410 || err.status === 409)) {
+          backToSignup(err.message);
+          return;
+        }
+        throw err;
+      }
+      setStatus("Account created. Jacked in.");
+    } else {
+      await postJSON("/auth/email/verify", { code });
+      setStatus("Email confirmed. Jacked in.");
+    }
     await start();
   });
+}
+
+async function resendSignupCode() {
+  signupResend.disabled = true;
+  try {
+    const res = await postJSON("/auth/signup/resend");
+    setStatus("New code sent to " + res.pendingEmail + ".");
+    verifyCode.focus();
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 410) backToSignup(err.message);
+    else setStatus(err.message, "error");
+  } finally {
+    signupResend.disabled = false;
+  }
 }
 
 function submitAddress(event) {
@@ -464,6 +564,7 @@ async function logout() {
     // Signing out locally is what matters; the cookie is cleared either way.
   }
   filesEl.replaceChildren();
+  closeAccount();
   setMode("login");
   showAuth();
   setStatus("Signed out.");
@@ -651,6 +752,17 @@ emailChangeForm.addEventListener("submit", submitEmailChange);
 emailCodeForm.addEventListener("submit", submitEmailCode);
 passwordForm.addEventListener("submit", submitPassword);
 logoutButton.addEventListener("click", logout);
+signupResend.addEventListener("click", resendSignupCode);
+signupRestart.addEventListener("click", () => {
+  backToSignup();
+  setStatus("");
+});
+whoami.addEventListener("click", openAccount);
+accountClose.addEventListener("click", closeAccount);
+// A click on the backdrop (outside the panel) closes it too.
+accountDialog.addEventListener("click", (event) => {
+  if (event.target === accountDialog) closeAccount();
+});
 uploadButton.addEventListener("click", upload);
 cancelButton.addEventListener("click", () => {
   if (activeUpload) activeUpload.abort();
