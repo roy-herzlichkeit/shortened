@@ -34,6 +34,34 @@ const conflictText = $("conflict-text");
 const refreshButton = $("refresh");
 const filesEl = $("files");
 const statusEl = $("status");
+const usernameLabel = $("username-label");
+const emailRow = $("email-row");
+const emailInput = $("email");
+const forgotOpen = $("forgot-open");
+const forgotView = $("forgot-view");
+const forgotForm = $("forgot-form");
+const forgotLogin = $("forgot-login");
+const resetForm = $("reset-form");
+const resetCode = $("reset-code");
+const resetPassword = $("reset-password");
+const forgotBack = $("forgot-back");
+const verifyView = $("verify-view");
+const verifyText = $("verify-text");
+const verifyForm = $("verify-form");
+const verifyCode = $("verify-code");
+const addressForm = $("address-form");
+const addressInput = $("address");
+const addressSubmit = $("address-submit");
+const accountEmail = $("account-email");
+const emailChangeForm = $("email-change-form");
+const newEmail = $("new-email");
+const emailChangePassword = $("email-change-password");
+const emailCodeForm = $("email-code-form");
+const emailCodeTarget = $("email-code-target");
+const emailCode = $("email-code");
+const passwordForm = $("password-form");
+const currentPassword = $("current-password");
+const newPassword = $("new-password");
 
 let mode = "login";
 let quota = { used: 0, total: 0 };
@@ -82,10 +110,16 @@ function postJSON(path, data) {
   });
 }
 
-// Any 401 means the session is gone: drop back to the sign-in form.
+// Any 401 means the session is gone: drop back to the sign-in form. A 403
+// with needsEmail means the account has no confirmed address yet.
 function handleError(err) {
   if (err instanceof ApiError && err.status === 401) {
     showAuth();
+    setStatus(err.message, "error");
+    return;
+  }
+  if (err instanceof ApiError && err.status === 403 && err.body && err.body.needsEmail) {
+    api("/auth/me").then(showVerify, () => showAuth());
     setStatus(err.message, "error");
     return;
   }
@@ -126,20 +160,63 @@ function checkFilename(raw) {
 
 /* ---------- Views ---------- */
 
+// Only one of the four views is shown at a time.
+function showView(view) {
+  for (const v of [authView, forgotView, verifyView, appView]) v.hidden = v !== view;
+}
+
 function showAuth() {
-  appView.hidden = true;
+  showView(authView);
   account.hidden = true;
-  authView.hidden = false;
   passwordInput.value = "";
   usernameInput.focus();
 }
 
+function showForgot() {
+  showView(forgotView);
+  account.hidden = true;
+  forgotForm.hidden = false;
+  resetForm.hidden = true;
+  forgotLogin.value = usernameInput.value.trim();
+  forgotLogin.focus();
+}
+
+// showVerify asks an account without a confirmed address for its code, or,
+// if no address is waiting (an account from before email), for an address.
+function showVerify(me) {
+  showView(verifyView);
+  account.hidden = false;
+  whoami.textContent = me.username;
+  verifyCode.value = "";
+  if (me.pendingEmail) {
+    verifyText.textContent = "We sent a 6-digit code to " + me.pendingEmail +
+      ". Enter it to start using your account. No mail? Check spam, or send a new code below.";
+    verifyForm.hidden = false;
+    addressInput.value = me.pendingEmail;
+    addressSubmit.textContent = "Send a new code";
+    verifyCode.focus();
+  } else {
+    verifyText.textContent = "Your account needs an email address before you can use it. " +
+      "It confirms it's you and lets you reset your password.";
+    verifyForm.hidden = true;
+    addressInput.value = "";
+    addressSubmit.textContent = "Send code";
+    addressInput.focus();
+  }
+}
+
 function showApp(me) {
-  authView.hidden = true;
-  appView.hidden = false;
+  showView(appView);
   account.hidden = false;
   whoami.textContent = me.username;
   renderUsage(me.usedBytes, me.quotaBytes);
+  renderAccount(me);
+}
+
+function renderAccount(me) {
+  accountEmail.textContent = me.email;
+  emailCodeForm.hidden = !me.pendingEmail;
+  emailCodeTarget.textContent = me.pendingEmail || "";
 }
 
 function setMode(next) {
@@ -149,8 +226,11 @@ function setMode(next) {
   modeSignup.setAttribute("aria-pressed", String(signup));
   authSubmit.textContent = signup ? "Create account" : "Sign in";
   passwordInput.autocomplete = signup ? "new-password" : "current-password";
+  usernameLabel.textContent = signup ? "Username" : "Username or email";
+  emailRow.hidden = !signup;
+  forgotOpen.hidden = signup;
   authHint.textContent = signup
-    ? "3-32 characters for the username (letters, digits, _ or -). Password 8-72 characters."
+    ? "3-32 characters for the username (letters, digits, _ or -). Password 8-72 characters. We mail a code to the address."
     : "Welcome back, choom.";
 }
 
@@ -242,14 +322,19 @@ function refreshQuietly() {
 }
 
 async function start() {
+  let me;
   try {
-    const me = await api("/auth/me");
-    showApp(me);
+    me = await api("/auth/me");
   } catch (err) {
     showAuth();
     if (!(err instanceof ApiError && err.status === 401)) setStatus(err.message, "error");
     return;
   }
+  if (!me.verified) {
+    showVerify(me);
+    return;
+  }
+  showApp(me);
   refresh().catch(handleError);
 }
 
@@ -259,24 +344,117 @@ async function submitAuth(event) {
   event.preventDefault();
   const username = usernameInput.value.trim();
   const password = passwordInput.value;
-  if (!username || !password) {
-    setStatus("Enter a username and a password.", "error");
+  const email = emailInput.value.trim();
+  if (!username || !password || (mode === "signup" && !email)) {
+    setStatus(mode === "signup" ? "Enter a username, an email address and a password." :
+      "Enter your username or email, and your password.", "error");
     return;
   }
 
   authSubmit.disabled = true;
   try {
-    await postJSON(mode === "signup" ? "/auth/signup" : "/auth/login", { username, password });
-    const me = await api("/auth/me");
-    showApp(me);
-    setStatus(mode === "signup" ? "Account created. Jacked in." : "Signed in.");
+    if (mode === "signup") await postJSON("/auth/signup", { username, password, email });
+    else await postJSON("/auth/login", { username, password });
+    setStatus(mode === "signup" ? "Account created. Check your email for the code." : "Signed in.");
   } catch (err) {
     setStatus(err.message, "error");
     return;
   } finally {
     authSubmit.disabled = false;
   }
-  refresh().catch(handleError);
+  await start();
+}
+
+// withButton disables a form's submit button while fn runs.
+async function withButton(form, fn) {
+  const button = form.querySelector("button[type=submit]");
+  button.disabled = true;
+  try {
+    await fn();
+  } catch (err) {
+    handleError(err);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function submitVerify(event) {
+  event.preventDefault();
+  withButton(verifyForm, async () => {
+    await postJSON("/auth/email/verify", { code: verifyCode.value.trim() });
+    setStatus("Email confirmed. Jacked in.");
+    await start();
+  });
+}
+
+function submitAddress(event) {
+  event.preventDefault();
+  withButton(addressForm, async () => {
+    const res = await postJSON("/auth/email", { email: addressInput.value.trim() });
+    showVerify(await api("/auth/me"));
+    setStatus("Code sent to " + res.pendingEmail + ".");
+  });
+}
+
+function submitForgot(event) {
+  event.preventDefault();
+  withButton(forgotForm, async () => {
+    const res = await postJSON("/auth/forgot", { login: forgotLogin.value.trim() });
+    setStatus(res.message);
+    resetForm.hidden = false;
+    resetCode.focus();
+  });
+}
+
+function submitReset(event) {
+  event.preventDefault();
+  withButton(resetForm, async () => {
+    await postJSON("/auth/reset", {
+      login: forgotLogin.value.trim(),
+      code: resetCode.value.trim(),
+      password: resetPassword.value
+    });
+    resetCode.value = "";
+    resetPassword.value = "";
+    setStatus("Password changed. Every other session is signed out.");
+    await start();
+  });
+}
+
+function submitEmailChange(event) {
+  event.preventDefault();
+  withButton(emailChangeForm, async () => {
+    const res = await postJSON("/auth/email", {
+      email: newEmail.value.trim(),
+      password: emailChangePassword.value
+    });
+    emailChangePassword.value = "";
+    emailCodeTarget.textContent = res.pendingEmail;
+    emailCodeForm.hidden = false;
+    emailCode.focus();
+    setStatus("Code sent to " + res.pendingEmail + ". Your address changes once you enter it.");
+  });
+}
+
+function submitEmailCode(event) {
+  event.preventDefault();
+  withButton(emailCodeForm, async () => {
+    const res = await postJSON("/auth/email/verify", { code: emailCode.value.trim() });
+    emailCode.value = "";
+    newEmail.value = "";
+    renderAccount(await api("/auth/me"));
+    setStatus("Your email is now " + res.email + ".");
+  });
+}
+
+function submitPassword(event) {
+  event.preventDefault();
+  withButton(passwordForm, async () => {
+    await postJSON("/auth/password", { current: currentPassword.value, password: newPassword.value });
+    currentPassword.value = "";
+    newPassword.value = "";
+    setStatus("Password changed. Every other session is signed out.");
+  });
 }
 
 async function logout() {
@@ -286,6 +464,7 @@ async function logout() {
     // Signing out locally is what matters; the cookie is cleared either way.
   }
   filesEl.replaceChildren();
+  setMode("login");
   showAuth();
   setStatus("Signed out.");
 }
@@ -459,6 +638,18 @@ async function releaseUpload(key) {
 modeLogin.addEventListener("click", () => setMode("login"));
 modeSignup.addEventListener("click", () => setMode("signup"));
 authForm.addEventListener("submit", submitAuth);
+forgotOpen.addEventListener("click", showForgot);
+forgotBack.addEventListener("click", () => {
+  showAuth();
+  setStatus("");
+});
+forgotForm.addEventListener("submit", submitForgot);
+resetForm.addEventListener("submit", submitReset);
+verifyForm.addEventListener("submit", submitVerify);
+addressForm.addEventListener("submit", submitAddress);
+emailChangeForm.addEventListener("submit", submitEmailChange);
+emailCodeForm.addEventListener("submit", submitEmailCode);
+passwordForm.addEventListener("submit", submitPassword);
 logoutButton.addEventListener("click", logout);
 uploadButton.addEventListener("click", upload);
 cancelButton.addEventListener("click", () => {

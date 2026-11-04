@@ -49,8 +49,10 @@ var dummyHash = sync.OnceValue(func() []byte {
 })
 
 type user struct {
-	id       int64
-	username string
+	id           int64
+	username     string
+	email        string // verified address, "" if none yet
+	pendingEmail string // address waiting for its code
 }
 
 type userKey struct{}
@@ -60,13 +62,15 @@ func userFrom(r *http.Request) user {
 }
 
 type loginRequest struct {
-	Username string `json:"username"`
+	Username string `json:"username"` // sign-in also takes the verified email here
 	Password string `json:"password"`
+	Email    string `json:"email"` // sign-up only
 }
 
 // readCredentials decodes and validates a sign-up or sign-in body, writing a
-// 400 and returning false when it is unusable.
-func readCredentials(w http.ResponseWriter, r *http.Request) (loginRequest, bool) {
+// 400 and returning false when it is unusable. Sign-in accepts an email
+// address in place of the username.
+func readCredentials(w http.ResponseWriter, r *http.Request, signin bool) (loginRequest, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	var c loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
@@ -74,7 +78,12 @@ func readCredentials(w http.ResponseWriter, r *http.Request) (loginRequest, bool
 		return c, false
 	}
 	c.Username = strings.ToLower(strings.TrimSpace(c.Username))
-	if !usernamePattern.MatchString(c.Username) {
+	if signin && strings.Contains(c.Username, "@") {
+		if _, err := normalizeEmail(c.Username); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return c, false
+		}
+	} else if !usernamePattern.MatchString(c.Username) {
 		writeError(w, http.StatusBadRequest, "username must be 3-32 characters: letters, digits, _ or -")
 		return c, false
 	}
@@ -91,8 +100,13 @@ func (s *server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "use POST")
 		return
 	}
-	c, ok := readCredentials(w, r)
+	c, ok := readCredentials(w, r, false)
 	if !ok {
+		return
+	}
+	email, err := normalizeEmail(c.Email)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -111,7 +125,12 @@ func (s *server) handleSignup(w http.ResponseWriter, r *http.Request) {
 	if !s.startSession(w, r, id) {
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"username": c.Username})
+	// The account exists now but can't hold files until the code is entered.
+	// A failed send leaves it to "send a new code" on the page.
+	if err := s.sendVerifyCode(r.Context(), user{id: id, username: c.Username}, email); err != nil {
+		log.Printf("sign-up code for user %d: %v", id, err)
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"username": c.Username, "pendingEmail": email})
 }
 
 // createUser inserts the account, or returns an HTTP status and message saying
@@ -169,21 +188,17 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "use POST")
 		return
 	}
-	c, ok := readCredentials(w, r)
+	c, ok := readCredentials(w, r, true)
 	if !ok {
 		// A malformed body says nothing about whether the account exists, so
 		// the specific validation message is fine here.
 		return
 	}
 
-	var (
-		id   int64
-		hash string
-	)
-	err := s.db.QueryRowContext(r.Context(),
-		`SELECT id, password_hash FROM users WHERE username = ?`, c.Username).Scan(&id, &hash)
+	u, hash, found, err := s.accountByLogin(r.Context(), c.Username)
+	id := u.id
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	case err == nil && !found:
 		_ = bcrypt.CompareHashAndPassword(dummyHash(), []byte(c.Password)) // only spent for its timing
 		writeError(w, http.StatusUnauthorized, "wrong username or password")
 		return
@@ -200,7 +215,7 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.startSession(w, r, id) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"username": c.Username})
+	writeJSON(w, http.StatusOK, map[string]string{"username": u.username})
 }
 
 func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -219,9 +234,12 @@ func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 type meResponse struct {
-	Username   string `json:"username"`
-	UsedBytes  int64  `json:"usedBytes"`
-	QuotaBytes int64  `json:"quotaBytes"`
+	Username     string `json:"username"`
+	Email        string `json:"email"`        // verified, "" if none
+	PendingEmail string `json:"pendingEmail"` // waiting for its code
+	Verified     bool   `json:"verified"`     // files need this
+	UsedBytes    int64  `json:"usedBytes"`
+	QuotaBytes   int64  `json:"quotaBytes"`
 }
 
 func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +255,10 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not read storage usage")
 		return
 	}
-	writeJSON(w, http.StatusOK, meResponse{Username: u.username, UsedBytes: used, QuotaBytes: s.cfg.quotaBytes})
+	writeJSON(w, http.StatusOK, meResponse{
+		Username: u.username, Email: u.email, PendingEmail: u.pendingEmail, Verified: u.email != "",
+		UsedBytes: used, QuotaBytes: s.cfg.quotaBytes,
+	})
 }
 
 // startSession stores a new session for userID and sets its cookie. Only a
@@ -298,11 +319,15 @@ func (s *server) requireUser(next http.HandlerFunc) http.Handler {
 			writeError(w, http.StatusUnauthorized, "sign in first")
 			return
 		}
-		var u user
+		var (
+			u              user
+			email, pending sql.NullString
+		)
 		err = s.db.QueryRowContext(r.Context(), `
-			SELECT u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
+			SELECT u.id, u.username, u.email, u.pending_email FROM sessions s JOIN users u ON u.id = s.user_id
 			WHERE s.token_hash = ? AND s.expires_at > ?`,
-			hashToken(c.Value), time.Now().Unix()).Scan(&u.id, &u.username)
+			hashToken(c.Value), time.Now().Unix()).Scan(&u.id, &u.username, &email, &pending)
+		u.email, u.pendingEmail = email.String, pending.String
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			http.SetCookie(w, s.sessionCookie("", -1))
@@ -315,6 +340,22 @@ func (s *server) requireUser(next http.HandlerFunc) http.Handler {
 		}
 		next(w, r.WithContext(context.WithValue(r.Context(), userKey{}, u)))
 	}))
+}
+
+// requireVerified is requireUser for routes that need a verified address: an
+// account from before email, or one whose sign-up code hasn't been entered
+// yet, gets 403 with needsEmail set, and the page asks for the address.
+func (s *server) requireVerified(next http.HandlerFunc) http.Handler {
+	return s.requireUser(func(w http.ResponseWriter, r *http.Request) {
+		if userFrom(r).email == "" {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error":      "confirm your email address first",
+				"needsEmail": true,
+			})
+			return
+		}
+		next(w, r)
+	})
 }
 
 // sameOrigin blocks cross-site requests that change state. SameSite=Lax

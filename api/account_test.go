@@ -1,0 +1,401 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func verifyBody(code string) string { return fmt.Sprintf(`{"code":%q}`, code) }
+
+// wrongCode is a 6-digit code that is not code.
+func wrongCode(code string) string {
+	if code == "000000" {
+		return "111111"
+	}
+	return "000000"
+}
+
+func TestSignupNeedsCodeBeforeFiles(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	c := signupUnverified(t, h, "alice")
+
+	me := decode[meResponse](t, do(t, h, http.MethodGet, "/auth/me", "", withCookie(c)))
+	if me.Verified || me.Email != "" || me.PendingEmail != "alice@example.test" {
+		t.Errorf("me before the code = %+v", me)
+	}
+	rec := do(t, h, http.MethodGet, "/download-url?key=x", "", withCookie(c))
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `"needsEmail":true`) {
+		t.Errorf("files before the code: status %d, body %s; want 403 needsEmail", rec.Code, rec.Body)
+	}
+
+	code := s.lastCode(t, "alice@example.test")
+	if code == "" {
+		t.Fatal("no code mailed at sign-up")
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(wrongCode(code)), withCookie(c)); rec.Code != http.StatusBadRequest {
+		t.Errorf("wrong code: status %d, want 400", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(code), withCookie(c)); rec.Code != http.StatusOK {
+		t.Fatalf("right code: status %d, body %s", rec.Code, rec.Body)
+	}
+	me = decode[meResponse](t, do(t, h, http.MethodGet, "/auth/me", "", withCookie(c)))
+	if !me.Verified || me.Email != "alice@example.test" || me.PendingEmail != "" {
+		t.Errorf("me after the code = %+v", me)
+	}
+	// Past the gate: the key check answers now, not the address check.
+	if rec := do(t, h, http.MethodGet, "/download-url?key=x", "", withCookie(c)); rec.Code != http.StatusBadRequest {
+		t.Errorf("files after the code: status %d, want 400 (bad key)", rec.Code)
+	}
+	// A code works once.
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(code), withCookie(c)); rec.Code != http.StatusBadRequest {
+		t.Errorf("code reused: status %d, want 400", rec.Code)
+	}
+}
+
+func TestSignupRequiresValidEmail(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint))
+	for _, email := range []string{"", "alice", "alice@", "@example.com", "alice@localhost", "Alice <a@example.com>", "a b@example.com"} {
+		body := fmt.Sprintf(`{"username":"alice","password":"correct horse battery","email":%q}`, email)
+		if rec := do(t, h, http.MethodPost, "/auth/signup", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("email %q: status %d, want 400", email, rec.Code)
+		}
+	}
+}
+
+func TestCodeStoredOnlyAsHash(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	signupUnverified(t, h, "alice")
+	code := s.lastCode(t, "alice@example.test")
+	var stored string
+	if err := s.db.QueryRow(`SELECT code_hash FROM otps`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stored, code) || !strings.HasPrefix(stored, "$2") {
+		t.Errorf("stored code %q is not a bcrypt hash of the code", stored)
+	}
+}
+
+func TestCodeDiesAfterFiveTries(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	c := signupUnverified(t, h, "alice")
+	code := s.lastCode(t, "alice@example.test")
+	for i := 0; i < codeTries; i++ {
+		if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(wrongCode(code)), withCookie(c)); rec.Code != http.StatusBadRequest {
+			t.Fatalf("try %d: status %d", i+1, rec.Code)
+		}
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(code), withCookie(c)); rec.Code != http.StatusBadRequest {
+		t.Errorf("right code after %d wrong tries: status %d, want 400", codeTries, rec.Code)
+	}
+}
+
+func TestCodeExpires(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	c := signupUnverified(t, h, "alice")
+	code := s.lastCode(t, "alice@example.test")
+	if _, err := s.db.Exec(`UPDATE otps SET expires_at = ?`, time.Now().Add(-time.Second).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(code), withCookie(c)); rec.Code != http.StatusBadRequest {
+		t.Errorf("expired code: status %d, want 400", rec.Code)
+	}
+}
+
+func TestThreeMailsPerHour(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	c := signupUnverified(t, h, "alice") // mail 1
+	for i := 2; i <= mailsPerHour; i++ {
+		if rec := do(t, h, http.MethodPost, "/auth/email", `{"email":"alice@example.test"}`, withCookie(c)); rec.Code != http.StatusAccepted {
+			t.Fatalf("resend %d: status %d, body %s", i, rec.Code, rec.Body)
+		}
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/email", `{"email":"alice@example.test"}`, withCookie(c)); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("4th mail in an hour: status %d, want 429", rec.Code)
+	}
+	if n := len(s.mails(t, "alice@example.test")); n != mailsPerHour {
+		t.Errorf("%d mails sent, want %d", n, mailsPerHour)
+	}
+	// An hour later the limit has room again.
+	if _, err := s.db.Exec(`UPDATE mail_log SET sent_at = sent_at - 3601`); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/email", `{"email":"alice@example.test"}`, withCookie(c)); rec.Code != http.StatusAccepted {
+		t.Errorf("after an hour: status %d, want 202", rec.Code)
+	}
+	// Each new code replaces the last.
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM otps`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("%d live codes (err %v), want 1", n, err)
+	}
+}
+
+// A verified address can't be taken by another account, and the sign-up
+// answer doesn't reveal that it is in use: the owner gets a notice instead.
+func TestEmailOnePerAccount(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	signup(t, h, "alice")
+	before := len(s.mails(t, "alice@example.test"))
+
+	body := `{"username":"bob","password":"correct horse battery","email":"ALICE@Example.TEST"}`
+	rec := do(t, h, http.MethodPost, "/auth/signup", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("sign-up with a taken address: status %d, want the usual 201", rec.Code)
+	}
+	bob := sessionFrom(t, rec)
+	ms := s.mails(t, "alice@example.test")
+	if len(ms) != before+1 || codeInText.MatchString(ms[len(ms)-1].text) || !strings.Contains(ms[len(ms)-1].text, "already belongs") {
+		t.Errorf("owner should get a notice without a code; got %d new mails", len(ms)-before)
+	}
+	// Bob has no code to enter, and a guess doesn't take the address.
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody("123456"), withCookie(bob)); rec.Code != http.StatusBadRequest {
+		t.Errorf("verify without a code: status %d, want 400", rec.Code)
+	}
+}
+
+func TestLoginWithEmail(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint))
+	signup(t, h, "alice")
+	signupUnverified(t, h, "bob")
+
+	if rec := do(t, h, http.MethodPost, "/auth/login", `{"username":"Alice@Example.test","password":"correct horse battery"}`); rec.Code != http.StatusOK ||
+		!strings.Contains(rec.Body.String(), `"username":"alice"`) {
+		t.Errorf("login by email: status %d, body %s", rec.Code, rec.Body)
+	}
+	// A pending address is not a login.
+	if rec := do(t, h, http.MethodPost, "/auth/login", `{"username":"bob@example.test","password":"correct horse battery"}`); rec.Code != http.StatusUnauthorized {
+		t.Errorf("login by unverified email: status %d, want 401", rec.Code)
+	}
+	wrong := do(t, h, http.MethodPost, "/auth/login", `{"username":"alice@example.test","password":"wrong password"}`).Body.String()
+	unknown := do(t, h, http.MethodPost, "/auth/login", `{"username":"nobody@example.test","password":"wrong password"}`).Body.String()
+	if wrong != unknown {
+		t.Errorf("unknown-email and wrong-password answers differ: %q vs %q", unknown, wrong)
+	}
+}
+
+func TestForgotAndReset(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	s.limiter = newIPLimiter(time.Millisecond, 100) // more calls than the real limit allows
+	first := signup(t, h, "alice")
+	second := do(t, h, http.MethodPost, "/auth/login", creds("alice", "correct horse battery"))
+	other := sessionFrom(t, second)
+	signupUnverified(t, h, "bob") // no verified address
+
+	answers := map[string]string{}
+	for _, login := range []string{"alice", "ALICE@example.test", "nobody", "nobody@example.test", "bob"} {
+		rec := do(t, h, http.MethodPost, "/auth/forgot", fmt.Sprintf(`{"login":%q}`, login))
+		if rec.Code != http.StatusAccepted {
+			t.Errorf("forgot %q: status %d", login, rec.Code)
+		}
+		answers[rec.Body.String()] = login
+	}
+	if len(answers) != 1 {
+		t.Errorf("forgot answers differ by account: %v", answers)
+	}
+	if n := len(s.mails(t, "bob@example.test")); n != 1 { // only the sign-up code
+		t.Errorf("bob (unverified) got %d mails, want 1", n)
+	}
+
+	code := s.lastCode(t, "alice@example.test")
+	reset := func(login, code, pass string) int {
+		return do(t, h, http.MethodPost, "/auth/reset",
+			fmt.Sprintf(`{"login":%q,"code":%q,"password":%q}`, login, code, pass)).Code
+	}
+	if got := reset("nobody", code, "brand new password"); got != http.StatusBadRequest {
+		t.Errorf("reset of an unknown account: status %d, want 400", got)
+	}
+	if got := reset("alice", wrongCode(code), "brand new password"); got != http.StatusBadRequest {
+		t.Errorf("reset with a wrong code: status %d, want 400", got)
+	}
+	rec := do(t, h, http.MethodPost, "/auth/reset", fmt.Sprintf(`{"login":"alice","code":%q,"password":"brand new password"}`, code))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset: status %d, body %s", rec.Code, rec.Body)
+	}
+	fresh := sessionFrom(t, rec)
+
+	for name, c := range map[string]*http.Cookie{"first": first, "second": other} {
+		if rec := do(t, h, http.MethodGet, "/auth/me", "", withCookie(c)); rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s session after reset: status %d, want 401", name, rec.Code)
+		}
+	}
+	if rec := do(t, h, http.MethodGet, "/auth/me", "", withCookie(fresh)); rec.Code != http.StatusOK {
+		t.Errorf("session from the reset: status %d, want 200", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/login", creds("alice", "correct horse battery")); rec.Code != http.StatusUnauthorized {
+		t.Errorf("old password after reset: status %d, want 401", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/login", creds("alice", "brand new password")); rec.Code != http.StatusOK {
+		t.Errorf("new password: status %d, want 200", rec.Code)
+	}
+	if got := reset("alice", code, "another password"); got != http.StatusBadRequest {
+		t.Errorf("reset code reused: status %d, want 400", got)
+	}
+}
+
+func TestChangeEmail(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	c := signup(t, h, "alice")
+
+	if rec := do(t, h, http.MethodPost, "/auth/email", `{"email":"new@example.test","password":"wrong password"}`, withCookie(c)); rec.Code != http.StatusForbidden {
+		t.Errorf("change without the password: status %d, want 403", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/email", `{"email":"new@example.test","password":"correct horse battery"}`, withCookie(c)); rec.Code != http.StatusAccepted {
+		t.Fatalf("change: status %d, body %s", rec.Code, rec.Body)
+	}
+	// Until the code is entered, the old address is still the one.
+	me := decode[meResponse](t, do(t, h, http.MethodGet, "/auth/me", "", withCookie(c)))
+	if me.Email != "alice@example.test" || me.PendingEmail != "new@example.test" || !me.Verified {
+		t.Errorf("me while pending = %+v", me)
+	}
+	code := s.lastCode(t, "new@example.test")
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(code), withCookie(c)); rec.Code != http.StatusOK {
+		t.Fatalf("verify new address: status %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/login", `{"username":"new@example.test","password":"correct horse battery"}`); rec.Code != http.StatusOK {
+		t.Errorf("login with the new address: status %d", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/login", `{"username":"alice@example.test","password":"correct horse battery"}`); rec.Code != http.StatusUnauthorized {
+		t.Errorf("login with the old address: status %d, want 401", rec.Code)
+	}
+}
+
+// A reset code mailed to an address the account no longer has is void.
+func TestResetCodeVoidAfterEmailChange(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	c := signup(t, h, "alice")
+	do(t, h, http.MethodPost, "/auth/forgot", `{"login":"alice"}`)
+	resetCode := s.lastCode(t, "alice@example.test")
+
+	do(t, h, http.MethodPost, "/auth/email", `{"email":"new@example.test","password":"correct horse battery"}`, withCookie(c))
+	do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(s.lastCode(t, "new@example.test")), withCookie(c))
+
+	rec := do(t, h, http.MethodPost, "/auth/reset", fmt.Sprintf(`{"login":"alice","code":%q,"password":"brand new password"}`, resetCode))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("old reset code after an address change: status %d, want 400", rec.Code)
+	}
+}
+
+func TestChangePassword(t *testing.T) {
+	_, h := newTestServer(t, testConfig(testEndpoint))
+	c := signup(t, h, "alice")
+	other := sessionFrom(t, do(t, h, http.MethodPost, "/auth/login", creds("alice", "correct horse battery")))
+
+	if rec := do(t, h, http.MethodPost, "/auth/password", `{"current":"wrong password","password":"brand new password"}`, withCookie(c)); rec.Code != http.StatusForbidden {
+		t.Errorf("wrong current password: status %d, want 403", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/password", `{"current":"correct horse battery","password":"short"}`, withCookie(c)); rec.Code != http.StatusBadRequest {
+		t.Errorf("short new password: status %d, want 400", rec.Code)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/password", `{"current":"correct horse battery","password":"brand new password"}`, withCookie(c)); rec.Code != http.StatusNoContent {
+		t.Fatalf("change: status %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, h, http.MethodGet, "/auth/me", "", withCookie(c)); rec.Code != http.StatusOK {
+		t.Errorf("this session after the change: status %d, want 200", rec.Code)
+	}
+	if rec := do(t, h, http.MethodGet, "/auth/me", "", withCookie(other)); rec.Code != http.StatusUnauthorized {
+		t.Errorf("other session after the change: status %d, want 401", rec.Code)
+	}
+}
+
+func TestCodeEndpointsRateLimited(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	s.limiter = newIPLimiter(time.Hour, 10) // never refills during the test
+	for i := 0; i < 10; i++ {
+		do(t, h, http.MethodPost, "/auth/reset", `{"login":"alice","code":"123456","password":"long enough pass"}`, withRemoteAddr("192.0.2.9:1"))
+	}
+	for _, path := range []string{"/auth/reset", "/auth/forgot", "/auth/email/verify", "/auth/login"} {
+		if rec := do(t, h, http.MethodPost, path, `{}`, withRemoteAddr("192.0.2.9:1")); rec.Code != http.StatusTooManyRequests {
+			t.Errorf("%s after 10 tries from one IP: status %d, want 429", path, rec.Code)
+		}
+	}
+}
+
+func TestMailBodies(t *testing.T) {
+	m := verifyMessage("a@example.test", "alice", "042517")
+	for name, body := range map[string]string{"text": m.text, "html": m.html} {
+		if !strings.Contains(body, "042517") || !strings.Contains(body, "10 minutes") {
+			t.Errorf("%s body lacks the code or its lifetime:\n%s", name, body)
+		}
+	}
+	for _, m := range []message{m, resetMessage("a@example.test", "alice", "042517"), inUseMessage("a@example.test")} {
+		if strings.Contains(m.html, "<img") || strings.Contains(m.html, "http") || strings.Contains(m.text, "http") {
+			t.Errorf("%q has an image or a link; mails carry no tracking:\n%s", m.subject, m.html)
+		}
+	}
+}
+
+// Accounts from before email keep working: they sign in and are asked for an
+// address, and their files wait until it is verified.
+func TestMigrationKeepsUsers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			password_hash TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+		`CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL)`,
+		`CREATE TABLE files (key TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			size INTEGER NOT NULL, created_at INTEGER NOT NULL, confirmed_at INTEGER NOT NULL DEFAULT 0, replaces TEXT NOT NULL DEFAULT '')`,
+	} {
+		if _, err := old.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, name := range []string{"one", "two", "three", "four"} {
+		if _, err := old.Exec(`INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, 'x', 0)`, i+1, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old.Close()
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("open old database: %v", err)
+	}
+	have, err := columnsOf(db, "users")
+	if err != nil || !have["email"] || !have["pending_email"] {
+		t.Fatalf("columns after migration: %v, %v", have, err)
+	}
+	var n, maxID int
+	if err := db.QueryRow(`SELECT COUNT(*), MAX(id) FROM users WHERE email IS NULL`).Scan(&n, &maxID); err != nil || n != 4 || maxID != 4 {
+		t.Errorf("users after migration: %d (max id %d), err %v; want the 4 kept", n, maxID, err)
+	}
+	db.Close()
+	// Reopening an already-migrated database is a no-op.
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	db.Close()
+
+	// Now the same through the app: an account with no address.
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	signup(t, h, "alice")
+	if _, err := s.db.Exec(`UPDATE users SET email = NULL, pending_email = NULL`); err != nil {
+		t.Fatal(err)
+	}
+	c := sessionFrom(t, do(t, h, http.MethodPost, "/auth/login", creds("alice", "correct horse battery")))
+	me := decode[meResponse](t, do(t, h, http.MethodGet, "/auth/me", "", withCookie(c)))
+	if me.Verified || me.Email != "" {
+		t.Errorf("me for an account without an address = %+v", me)
+	}
+	if rec := do(t, h, http.MethodGet, "/download-url?key=x", "", withCookie(c)); rec.Code != http.StatusForbidden {
+		t.Errorf("files without an address: status %d, want 403", rec.Code)
+	}
+	// Adding the first address needs no password (the session is fresh).
+	if rec := do(t, h, http.MethodPost, "/auth/email", `{"email":"alice2@example.test"}`, withCookie(c)); rec.Code != http.StatusAccepted {
+		t.Fatalf("add address: status %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", verifyBody(s.lastCode(t, "alice2@example.test")), withCookie(c)); rec.Code != http.StatusOK {
+		t.Fatalf("verify added address: status %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, h, http.MethodGet, "/download-url?key=x", "", withCookie(c)); rec.Code != http.StatusBadRequest {
+		t.Errorf("files after verifying: status %d, want 400 (bad key)", rec.Code)
+	}
+}

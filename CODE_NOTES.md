@@ -27,10 +27,15 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | --- | --- | --- |
 | `GET /`, `/app.js`, `/style.css` | none | The page, with a strict CSP. |
 | `GET /health` | none | `{"status":"ok"}` once the database answers. |
-| `POST /auth/signup` | none, rate-limited | `{"username","password"}` → `201`, sets the session cookie. |
-| `POST /auth/login` | none, rate-limited | Same body → `200`, sets the session cookie. |
+| `POST /auth/signup` | none, rate-limited | `{"username","password","email"}` → `201 {"username","pendingEmail"}`, sets the session cookie and mails a code. The account can't hold files until the code is entered. |
+| `POST /auth/login` | none, rate-limited | `{"username","password"}`, where `username` may also be the verified email → `200`, sets the session cookie. |
 | `POST /auth/logout` | cookie | Ends this session → `204`. |
-| `GET /auth/me` | cookie | `{"username","usedBytes","quotaBytes"}`. |
+| `GET /auth/me` | cookie | `{"username","email","pendingEmail","verified","usedBytes","quotaBytes"}`. |
+| `POST /auth/email` | cookie, rate-limited | `{"email","password"}` → `202 {"pendingEmail"}`: mails a code to the address (first address, a new code, or a change; a change needs the password, else `403`). Over 3 mails an hour → `429`. |
+| `POST /auth/email/verify` | cookie, rate-limited | `{"code"}` → `200 {"email"}`: the pending address becomes the account's. Wrong or expired → `400`. |
+| `POST /auth/forgot` | none, rate-limited | `{"login"}` (username or email) → always `202` with the same message; a code goes to the verified address if there is one. |
+| `POST /auth/reset` | none, rate-limited | `{"login","code","password"}` → `200`, sets the password, ends every session, starts a new one. Any failure → `400` "that code is wrong or has expired". |
+| `POST /auth/password` | cookie, rate-limited | `{"current","password"}` → `204`, ends every other session. Wrong current password → `403`. |
 | `POST /upload-url` | cookie | `{"filename","size","onConflict"}` → `{"key","url","name"}`, a presigned PUT. `onConflict` is `""` (ask), `"replace"` or `"keepboth"`. A name in use with `""` gets `409 {"error","conflict":true,"name","suggestion"}`; a name with an upload still in flight gets `409 {"error"}`; a refused name gets `400`; no room gets `413`. |
 | `POST /files/confirm?key=` | cookie | After a successful PUT. HEADs the object, records its real size, finishes a Replace → `{"usedBytes","quotaBytes"}`. No object → `404`, and the reservation is dropped. |
 | `POST /files/release?key=` | cookie | After a failed or cancelled PUT. Drops the reservation at once (or confirms it, if the object did land) → `{"usedBytes","quotaBytes"}`. Never drops a confirmed file. |
@@ -201,10 +206,41 @@ copies users into a new table with the same IDs, swaps it in with foreign keys
 off, and runs `PRAGMA foreign_key_check` before committing. Opening an
 already-migrated database does nothing.
 
+**Email and codes (v2).** Mail goes through Amazon SES as
+`no-reply@shortened.herzlichkeit-zero.click` (`api/mail.go`). The domain is
+signed with Easy DKIM, and DMARC is `p=none` (`deploy/email.yaml`). Bodies are
+plain text plus simple HTML, with no images, links or tracking. Locally and in
+CI, `MAIL_LOG=true` writes each mail to the log instead.
+
+- `users.email` is the **verified** address only: unique, case-insensitive
+  (`users_email` index), NULL until verified. `pending_email` holds an address
+  waiting for its code. Keeping them apart means an address nobody has proved
+  they own can't block the real owner. Files and links need a verified address
+  (`requireVerified` → `403 {"needsEmail":true}`, and the page asks for it).
+- Accounts from before email (migrated by `migrateUsersEmail`, logged as
+  `migration: users table gained email, pending_email`) sign in as before, are
+  asked for an address, and get their files back once it is verified.
+- Codes are 6 random digits, stored only as a bcrypt hash in `otps`, one per
+  account and purpose (`verify`, `reset`). A new code replaces the old one.
+  Each lasts 10 minutes and allows 5 tries; the try is counted before the
+  comparison. A reset code is void if the account's address has changed since.
+- At most 3 mails an hour per account (`mail_log`). Every code and password
+  endpoint shares the sign-in limiter (10 per IP, then one every 6 s).
+- Nothing reveals whether an address or a username has an account. Forgot always
+  gives the same `202` text. Signing up with an address another account has
+  verified gives the usual `201`, and the owner gets a notice instead of a code.
+  Mail is sent in the background, so the response time doesn't depend on
+  whether a mail went out, and an unknown login still spends one bcrypt.
+- A reset sets the new password and ends **every** session; changing the
+  password ends every **other** session.
+
 ## Known limits
 
-- **No email.** Accounts have no email address, so a forgotten password can't
-  be recovered and there is no verification. An admin can only delete the row.
+- **SES sandbox.** Until AWS grants production access, SES only delivers to
+  verified addresses (200 a day). The boundary then also names the test
+  address, because the sandbox authorises the recipient identity too.
+- **Unverified sign-ups keep their username.** An account whose code is never
+  entered stays until it is deleted by hand.
 - **No account deletion.** Users can't delete their own accounts. The `files`
   rows cascade, but the objects in B2 would have to be removed separately.
 - **Single process only.** The rate limiter is in memory and SQLite is a local
@@ -225,6 +261,10 @@ Optional, with defaults:
 - `TRUST_PROXY` = `false`
 - `TLS_CERT_FILE`, `TLS_KEY_FILE` = empty, meaning plain HTTP. Set both to
   serve HTTPS; setting only one stops the server at start-up.
+- `MAIL_FROM` = empty. When set, mail goes through SES as this address.
+- `SES_REGION` = `us-east-1`
+- `MAIL_LOG` = `false`. `true` logs mail instead (local and CI only). One of
+  `MAIL_FROM` or `MAIL_LOG=true` is required.
 
 See `.env.example` for what each one does.
 
@@ -352,6 +392,24 @@ folders already in use), all files removed afterwards:
   in `.agent/shots/after/`. For the flows that need the PUT to reach B2, that
   Chrome ran with web security off in a throwaway profile, because the dev
   bucket's CORS rule doesn't list `http://localhost:8092`, where the test ran.
+
+**Email, codes and reset (v2 Prompt 11)**, on 2026-11-04:
+
+- `go test ./...`, `go vet`, gofmt, html-validate and `node --check` are clean.
+  The tests in `api/account_test.go` use a fake mailer. They cover the code
+  before files, the hash-only storage, 5 tries, expiry, 3 mails an hour, one
+  account per address with no leak at sign-up, sign-in by email, forgot (the
+  same answer for every kind of login) and reset (sessions ended), an email
+  change (the old address holds until the code; a reset code mailed to the old
+  address goes void), a password change (other sessions ended), the rate limit
+  on the code endpoints, mail bodies without links or images, and the
+  migration of an old database with its 4 users kept.
+- The page in headless Chrome against a local server with `MAIL_LOG=true`,
+  codes read from the log (19 checks): sign-up → code (a wrong one first) →
+  app, sign-in by email in any case, an email change, a password change,
+  forgot → reset → signed in, no overflow at 390 and 320 px, and no script
+  errors. That run found two bugs, both fixed: the form stayed in sign-up mode
+  after signing out, and a long button label widened the page at 320 px.
 
 Not run:
 

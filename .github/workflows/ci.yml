@@ -100,6 +100,7 @@ jobs:
             -e B2_REGION=us-west-004 \
             -e B2_BUCKET=ci-bucket \
             -e COOKIE_SECURE=false \
+            -e MAIL_LOG=true \
             shortened-api:ci
 
       - name: HEALTHCHECK reports healthy
@@ -142,13 +143,22 @@ jobs:
           expect 401 "$base/auth/me"
 
           # Sign up, then the session works
-          expect 201 -c "$jar" -H "$json" -d '{"username":"ci-user","password":"ci-password-123"}' "$base/auth/signup"
+          expect 201 -c "$jar" -H "$json" -d '{"username":"ci-user","password":"ci-password-123","email":"ci-user@example.test"}' "$base/auth/signup"
           grep -q 'HttpOnly' "$jar" || grep -q '#HttpOnly_' "$jar" || { echo "session cookie is not HttpOnly"; cat "$jar"; exit 1; }
           expect 200 -b "$jar" "$base/auth/me"
           grep -q '"username":"ci-user"' /tmp/body || { echo "wrong user"; cat /tmp/body; exit 1; }
-          expect 409 -H "$json" -d '{"username":"CI-USER","password":"another-password"}' "$base/auth/signup"
+          expect 409 -H "$json" -d '{"username":"CI-USER","password":"another-password","email":"other@example.test"}' "$base/auth/signup"
           expect 401 -H "$json" -d '{"username":"ci-user","password":"wrong-password"}' "$base/auth/login"
           expect 403 -b "$jar" -H "$json" -H 'Origin: https://evil.example' -d '{"filename":"a","size":1}' "$base/upload-url"
+
+          # Files wait for the emailed code (MAIL_LOG=true writes it to the log)
+          expect 403 -b "$jar" -H "$json" -d '{"filename":"a.bin","size":1}' "$base/upload-url"
+          grep -q '"needsEmail":true' /tmp/body || { echo "no needsEmail before the code"; cat /tmp/body; exit 1; }
+          code="$(docker logs api 2>&1 | grep -A6 'MAIL_LOG to=ci-user@example.test' | grep -oE '^    [0-9]{6}$' | tail -1 | tr -d ' ')"
+          [ -n "$code" ] || { echo "no code in the log"; docker logs api; exit 1; }
+          expect 200 -b "$jar" -H "$json" -d "{\"code\":\"$code\"}" "$base/auth/email/verify"
+          expect 200 -H "$json" -d '{"username":"ci-user@example.test","password":"ci-password-123"}' "$base/auth/login"
+          expect 202 -H "$json" -d '{"login":"nobody"}' "$base/auth/forgot"
 
           # Signing, with the size bound into the upload URL
           expect 413 -b "$jar" -H "$json" -d '{"filename":"a.bin","size":52428801}' "$base/upload-url"

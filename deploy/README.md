@@ -258,6 +258,34 @@ parameters made no change to the live stack.
   instance.
 - `deploy/teardown.sh` deletes staging first.
 
+## Email (`email.yaml`, stack `shortened-email`)
+
+The SES domain identity `shortened.herzlichkeit-zero.click` with Easy DKIM
+(2048-bit), its three DKIM CNAMEs, and `_dmarc.shortened…` TXT
+`v=DMARC1; p=none`, all under `shortened.` in the apex zone. While SES is in
+its sandbox, the parameter `TestRecipient` also verifies one address (SES mails
+it a link to click), because the sandbox delivers only to verified addresses.
+
+- The app sends as `no-reply@shortened.herzlichkeit-zero.click`. Each instance
+  role may call `ses:SendEmail` only with that From address
+  (`SendMailAsNoReply` in `shortened.yaml`), and the boundary limits the
+  identities: the domain, plus the test address while sandboxed.
+- The app reads `MAIL_FROM` from SSM: `/shortened/MAIL_FROM` and
+  `/shortened-staging/MAIL_FROM` (String). **Create them before deploying an
+  app version with email**, or the service won't start.
+- The deployer needs the SES identity rights from
+  `.agent/aws/phase-v2b/apply-phase-v2b.sh` to create or delete this stack.
+
+**Production access** (leaving the sandbox): in the SES console (us-east-1),
+choose Account dashboard → Request production access. Mail type
+*Transactional*; website `https://shortened.herzlichkeit-zero.click`; use case
+along the lines of: "Sign-up verification codes and password reset codes for a
+small file-sharing site, one mail per user action, at most 3 per account per
+hour. Recipients are only users who typed their own address. Bounces and
+complaints are watched in the SES dashboard; there are no lists and no
+marketing." AWS usually answers within a day. After it is granted, drop the
+test address from the boundary and set `TestRecipient` to empty.
+
 ## Delete
 
 `DeleteStack` (turn termination protection off first). Ask first: this
