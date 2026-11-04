@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -49,11 +50,15 @@ func testConfig(endpoint string) config {
 type fakeMailer struct {
 	mu   sync.Mutex
 	sent []message
+	fail bool // refuse every message, as SES does for an unverified address
 }
 
 func (f *fakeMailer) send(_ context.Context, m message) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.fail {
+		return errors.New("fake mailer: refused")
+	}
 	f.sent = append(f.sent, m)
 	return nil
 }
@@ -168,27 +173,50 @@ func sessionFrom(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
 	return nil
 }
 
-// signup registers a user, enters the code mailed to <user>@example.test, and
-// returns the session cookie of the now verified account.
+// signup signs a user up with <user>@example.test, enters the mailed code,
+// and returns the session cookie of the new (verified) account.
 func signup(t *testing.T, h http.Handler, username string) *http.Cookie {
 	t.Helper()
-	c := signupUnverified(t, h, username)
+	sc := startSignup(t, h, username)
 	code := serverOf(t, h).lastCode(t, emailOf(username))
-	if rec := do(t, h, http.MethodPost, "/auth/email/verify", fmt.Sprintf(`{"code":%q}`, code), withCookie(c)); rec.Code != http.StatusOK {
-		t.Fatalf("verify %s: status %d, body %s", username, rec.Code, rec.Body)
-	}
-	return c
-}
-
-// signupUnverified registers a user and returns the session cookie, without
-// entering the code.
-func signupUnverified(t *testing.T, h http.Handler, username string) *http.Cookie {
-	t.Helper()
-	rec := do(t, h, http.MethodPost, "/auth/signup", creds(username, "correct horse battery"))
+	rec := do(t, h, http.MethodPost, "/auth/signup/verify", fmt.Sprintf(`{"code":%q}`, code), withCookie(sc))
 	if rec.Code != http.StatusCreated {
-		t.Fatalf("signup %s: status %d, body %s", username, rec.Code, rec.Body)
+		t.Fatalf("verify sign-up %s: status %d, body %s", username, rec.Code, rec.Body)
 	}
 	return sessionFrom(t, rec)
+}
+
+// startSignup posts the sign-up form and returns the pending sign-up's
+// cookie, without entering the code. No account exists yet.
+func startSignup(t *testing.T, h http.Handler, username string) *http.Cookie {
+	t.Helper()
+	rec := do(t, h, http.MethodPost, "/auth/signup", creds(username, "correct horse battery"))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("signup %s: status %d, body %s", username, rec.Code, rec.Body)
+	}
+	return signupCookieFrom(t, rec)
+}
+
+func signupCookieFrom(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
+	t.Helper()
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == signupCookieName && c.Value != "" {
+			return c
+		}
+	}
+	t.Fatalf("no signup cookie in response (status %d, body %s)", rec.Code, rec.Body)
+	return nil
+}
+
+// legacyUser makes an account like those from before email (no address),
+// and returns a session cookie for it.
+func legacyUser(t *testing.T, h http.Handler, username string) *http.Cookie {
+	t.Helper()
+	signup(t, h, username)
+	if _, err := serverOf(t, h).db.Exec(`UPDATE users SET email = NULL, pending_email = NULL WHERE username = ?`, username); err != nil {
+		t.Fatal(err)
+	}
+	return sessionFrom(t, do(t, h, http.MethodPost, "/auth/login", creds(username, "correct horse battery")))
 }
 
 func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
@@ -304,16 +332,12 @@ func TestValidKeyRejects(t *testing.T) {
 func TestSignupLoginLogout(t *testing.T) {
 	_, h := newTestServer(t, testConfig(testEndpoint))
 
-	rec := do(t, h, http.MethodPost, "/auth/signup", creds("Alice", "correct horse battery"))
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("signup: status %d, body %s", rec.Code, rec.Body)
-	}
-	c := sessionFrom(t, rec)
+	c := signup(t, h, "Alice")
 	if !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteLaxMode || c.Path != "/" {
 		t.Errorf("cookie flags: HttpOnly=%v Secure=%v SameSite=%v Path=%q", c.HttpOnly, c.Secure, c.SameSite, c.Path)
 	}
 
-	rec = do(t, h, http.MethodGet, "/auth/me", "", withCookie(c))
+	rec := do(t, h, http.MethodGet, "/auth/me", "", withCookie(c))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("me: status %d, body %s", rec.Code, rec.Body)
 	}
@@ -461,8 +485,13 @@ func TestSameOriginBehindCDN(t *testing.T) {
 
 func TestSessionCookieFlags(t *testing.T) {
 	_, h := newTestServer(t, testConfig(testEndpoint)) // cookieSecure: true, the default
-	rec := do(t, h, http.MethodPost, "/auth/signup", creds("alice", "correct horse battery"))
-	c := sessionFrom(t, rec)
+	sc := startSignup(t, h, "alice")
+	if !sc.Secure || !sc.HttpOnly || sc.SameSite != http.SameSiteLaxMode || sc.Path != "/auth/signup" {
+		t.Errorf("signup cookie: Secure %v, HttpOnly %v, SameSite %v, Path %q; want Secure, HttpOnly, Lax, /auth/signup",
+			sc.Secure, sc.HttpOnly, sc.SameSite, sc.Path)
+	}
+	code := serverOf(t, h).lastCode(t, "alice@example.test")
+	c := sessionFrom(t, do(t, h, http.MethodPost, "/auth/signup/verify", fmt.Sprintf(`{"code":%q}`, code), withCookie(sc)))
 	if !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" {
 		t.Errorf("session cookie: Secure %v, HttpOnly %v, SameSite %v, Path %q; want Secure, HttpOnly, Lax, /",
 			c.Secure, c.HttpOnly, c.SameSite, c.Path)

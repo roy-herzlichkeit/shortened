@@ -184,7 +184,11 @@ func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/health", noStore(http.HandlerFunc(s.handleHealth)))
 
+	// Sign-up stores a request; the account exists once its code is entered.
 	mux.Handle("/auth/signup", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleSignup)))))
+	mux.Handle("/auth/signup/verify", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleSignupVerify)))))
+	mux.Handle("/auth/signup/resend", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleSignupResend)))))
+	mux.Handle("/auth/signup/pending", noStore(http.HandlerFunc(s.handleSignupPending)))
 	mux.Handle("/auth/login", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleLogin)))))
 	mux.Handle("/auth/logout", noStore(s.sameOrigin(http.HandlerFunc(s.handleLogout))))
 	mux.Handle("/auth/me", noStore(s.requireUser(s.handleMe)))

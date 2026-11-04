@@ -9,7 +9,8 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | Path | What it is |
 | --- | --- |
 | [api/main.go](api/main.go) | Config, B2 client, routes, the page handler with its CSP, and graceful shutdown. |
-| [api/auth.go](api/auth.go) | Sign-up, sign-in and sign-out, sessions, the `requireUser` and `sameOrigin` middleware, and the per-IP rate limiter. |
+| [api/signup.go](api/signup.go) | Two-step sign-up: a pending request and its code, then the account. |
+| [api/auth.go](api/auth.go) | Sign-in and sign-out, sessions, the `requireUser` and `sameOrigin` middleware, and the per-IP rate limiter. |
 | [api/files.go](api/files.go) | Upload/download signing, listing, delete, the quota ledger, and key and filename rules. |
 | [api/store.go](api/store.go) | Opens SQLite and creates the schema. |
 | [api/main_test.go](api/main_test.go) | Tests against a real SQLite file and an in-process fake S3 endpoint. |
@@ -27,7 +28,10 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | --- | --- | --- |
 | `GET /`, `/app.js`, `/style.css` | none | The page, with a strict CSP. |
 | `GET /health` | none | `{"status":"ok"}` once the database answers. |
-| `POST /auth/signup` | none, rate-limited | `{"username","password","email"}` → `201 {"username","pendingEmail"}`, sets the session cookie and mails a code. The account can't hold files until the code is entered. |
+| `POST /auth/signup` | none, rate-limited | `{"username","password","email"}` → `202 {"username","pendingEmail"}`. Stores a pending sign-up (no account yet), mails its code and sets the `signup` cookie (HttpOnly, path `/auth/signup`, 1 hour). Name taken → `409`; over 3 mails an hour to the address → `429`; mail refused → `502` and nothing is kept. |
+| `POST /auth/signup/verify` | `signup` cookie, rate-limited | `{"code"}` → `201 {"username"}`: creates the account with its address verified and sets the session cookie. Wrong or expired code → `400`; name or address taken meanwhile → `409`; no pending sign-up → `410`. |
+| `POST /auth/signup/resend` | `signup` cookie, rate-limited | Mails a new code → `202 {"pendingEmail"}`. Same `429`, `502` and `410` as above. |
+| `GET /auth/signup/pending` | `signup` cookie | `200 {"username","pendingEmail"}` or `404`; lets the page pick a sign-up back up after a reload. |
 | `POST /auth/login` | none, rate-limited | `{"username","password"}`, where `username` may also be the verified email → `200`, sets the session cookie. |
 | `POST /auth/logout` | cookie | Ends this session → `204`. |
 | `GET /auth/me` | cookie | `{"username","email","pendingEmail","verified","usedBytes","quotaBytes"}`. |
@@ -212,6 +216,15 @@ signed with Easy DKIM, and DMARC is `p=none` (`deploy/email.yaml`). Bodies are
 plain text plus simple HTML, with no images, links or tracking. Locally and in
 CI, `MAIL_LOG=true` writes each mail to the log instead.
 
+- **The account is created only when the code is right.** `POST /auth/signup`
+  stores a row in `signups` (username, password hash, address, code hash) and
+  mails the code; there is no `users` row and no session yet.
+  `POST /auth/signup/verify` with the right code creates the account, already
+  verified, and signs it in. The username is not reserved while waiting: if
+  someone else confirms the same name first, the later one gets `409` and
+  signs up again. A pending sign-up lives 1 hour (each code 10 minutes).
+  The sign-up mail is sent before answering, so an address SES refuses gets
+  `502` "could not send the code" instead of a silent wait.
 - `users.email` is the **verified** address only: unique, case-insensitive
   (`users_email` index), NULL until verified. `pending_email` holds an address
   waiting for its code. Keeping them apart means an address nobody has proved
@@ -224,13 +237,16 @@ CI, `MAIL_LOG=true` writes each mail to the log instead.
   account and purpose (`verify`, `reset`). A new code replaces the old one.
   Each lasts 10 minutes and allows 5 tries; the try is counted before the
   comparison. A reset code is void if the account's address has changed since.
-- At most 3 mails an hour per account (`mail_log`). Every code and password
+- At most 3 mails an hour per account (`mail_log`), and 3 sign-up mails an
+  hour per address (`signup_mail`). Every code and password
   endpoint shares the sign-in limiter (10 per IP, then one every 6 s).
 - Nothing reveals whether an address or a username has an account. Forgot always
   gives the same `202` text. Signing up with an address another account has
-  verified gives the usual `201`, and the owner gets a notice instead of a code.
-  Mail is sent in the background, so the response time doesn't depend on
-  whether a mail went out, and an unknown login still spends one bcrypt.
+  verified gives the usual `202`, and the owner gets a notice instead of a code
+  (sent the same way, so it takes as long). Forgot and the address codes of
+  existing accounts are sent in the background, so the response time doesn't
+  depend on whether a mail went out, and an unknown login still spends one
+  bcrypt.
 - A reset sets the new password and ends **every** session; changing the
   password ends every **other** session.
 
@@ -239,8 +255,6 @@ CI, `MAIL_LOG=true` writes each mail to the log instead.
 - **SES sandbox.** Until AWS grants production access, SES only delivers to
   verified addresses (200 a day). The boundary then also names the test
   address, because the sandbox authorises the recipient identity too.
-- **Unverified sign-ups keep their username.** An account whose code is never
-  entered stays until it is deleted by hand.
 - **No account deletion.** Users can't delete their own accounts. The `files`
   rows cascade, but the objects in B2 would have to be removed separately.
 - **Single process only.** The rate limiter is in memory and SQLite is a local
@@ -416,3 +430,19 @@ Not run:
 - The Docker image has not been rebuilt locally (Docker Desktop was not
   running). CI builds it and runs the smoke test.
 - Nothing has been deployed anywhere other than localhost.
+
+**Account created only after the code, Account as a pop-up**, on 2026-11-04:
+
+- `go test ./...`, `go vet`, gofmt, html-validate and `node --check` are clean.
+  New tests: no account or session before the code, `pending` after a reload,
+  a refused mail keeping nothing, 5 tries then a resend, expiry of the code and
+  of the whole request, 3 sign-up mails an hour per address (a fresh sign-up
+  doesn't get around it), the in-use notice, and two people waiting for one
+  name (the first to confirm gets it, the other `409`). The address flow of
+  accounts from before email keeps its own tests.
+- Headless Chrome against a local server: sign-up → code view (no account, `me`
+  401) → reload keeps it → new code → wrong code → right code → app; Account
+  opens as a dialog, its errors show inside it, Esc and Close shut it; at 320 px
+  neither the page nor the dialog scrolls sideways (the top bar now wraps its
+  user row; the new Account button had made it 385 px wide); a taken name is
+  refused at sign-up.

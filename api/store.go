@@ -25,6 +25,10 @@ import (
 // them apart means an address nobody has proved they own can't block the
 // real owner from using it. otps holds one live code per account and purpose,
 // as a bcrypt hash; mail_log counts mails per account for the hourly limit.
+//
+// signups holds sign-ups waiting for their code (see signup.go): no users row
+// exists until the code is entered. signup_mail counts sign-up mails per
+// address for the same hourly limit.
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +67,21 @@ CREATE TABLE IF NOT EXISTS mail_log (
 	sent_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS mail_log_user ON mail_log(user_id, sent_at);
+CREATE TABLE IF NOT EXISTS signups (
+	token_hash    TEXT    PRIMARY KEY,
+	username      TEXT    NOT NULL,
+	password_hash TEXT    NOT NULL,
+	email         TEXT    NOT NULL,
+	code_hash     TEXT    NOT NULL,
+	expires_at    INTEGER NOT NULL,
+	tries         INTEGER NOT NULL DEFAULT 0,
+	created_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS signup_mail (
+	email   TEXT    NOT NULL,
+	sent_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS signup_mail_email ON signup_mail(email, sent_at);
 `
 
 func openDB(path string) (*sql.DB, error) {
