@@ -40,6 +40,7 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | `POST /auth/forgot` | none, rate-limited | `{"login"}` (username or email) → always `202` with the same message; a code goes to the verified address if there is one. |
 | `POST /auth/reset` | none, rate-limited | `{"login","code","password"}` → `200`, sets the password, ends every session, starts a new one. Any failure → `400` "that code is wrong or has expired". |
 | `POST /auth/password` | cookie, rate-limited | `{"current","password"}` → `204`, ends every other session. Wrong current password → `403`. |
+| `POST /auth/account/delete` | cookie, rate-limited | `{"password","confirm"}` with `confirm` = `DELETE` → `204`, the cookie cleared. Deletes every B2 version under `u/<id>/`, then every row of the account. Wrong word → `400`, wrong password → `403`, an upload in flight → `409`, B2 failing → `502` with nothing else changed (asking again finishes). |
 | `POST /upload-url` | cookie | `{"filename","size","onConflict"}` → `{"key","url","name"}`, a presigned PUT. `onConflict` is `""` (ask), `"replace"` or `"keepboth"`. A name in use with `""` gets `409 {"error","conflict":true,"name","suggestion"}`; a name with an upload still in flight gets `409 {"error"}`; a refused name gets `400`; no room gets `413`. |
 | `POST /files/confirm?key=` | cookie | After a successful PUT. HEADs the object, records its real size, finishes a Replace → `{"usedBytes","quotaBytes"}`. No object → `404`, and the reservation is dropped. |
 | `POST /files/release?key=` | cookie | After a failed or cancelled PUT. Drops the reservation at once (or confirms it, if the object did land) → `{"usedBytes","quotaBytes"}`. Never drops a confirmed file. |
@@ -250,13 +251,31 @@ CI, `MAIL_LOG=true` writes each mail to the log instead.
 - A reset sets the new password and ends **every** session; changing the
   password ends every **other** session.
 
+## Account deletion
+
+Immediate, from the Account dialog: the password plus the word `DELETE`, under
+a warning that premium is lost with no refund. `api/delete.go`, in this order:
+
+1. Check the word and the password; refuse (`409`) while an upload link is
+   still out, since its bytes could land after the folder was emptied.
+2. Delete every object version and hide marker under `u/<id>/`, one
+   `DeleteObject` per version, then list again; anything left is an error.
+3. One transaction deletes the sessions, codes, mail log, ledger rows and the
+   user row.
+4. Clear the cookie and mail a confirmation to the verified address (in the
+   background; a failed mail doesn't undo anything).
+
+If B2 fails in step 2, the database is untouched: the account still signs in
+and asking again deletes what is left. Step 3 is all or nothing. The username
+and address are free again afterwards; the id never comes back
+(`AUTOINCREMENT`), so a new account can't see an old folder. Share links
+(Prompt 13) must join step 3.
+
 ## Known limits
 
 - **SES sandbox.** Until AWS grants production access, SES only delivers to
   verified addresses (200 a day). The boundary then also names the test
   address, because the sandbox authorises the recipient identity too.
-- **No account deletion.** Users can't delete their own accounts. The `files`
-  rows cascade, but the objects in B2 would have to be removed separately.
 - **Single process only.** The rate limiter is in memory and SQLite is a local
   file. Running several copies needs a shared limiter and a server database.
 - **Coarse limits.** The rate limit is per IP, not per account, so a botnet
@@ -464,3 +483,20 @@ Not run:
   neither the page nor the dialog scrolls sideways (the top bar now wraps its
   user row; the new Account button had made it 385 px wide); a taken name is
   refused at sign-up.
+
+**Account deletion**, on 2026-11-04:
+
+- `go test ./...`, `go vet`, gofmt, staticcheck, gosec, html-validate and
+  `node --check` are clean. New tests: an account with files, an older version
+  and a hide marker is emptied in B2 and in every table, both its sessions end,
+  another user's file stays, a mail goes out, and the same username and address
+  sign up again with a new id and an empty folder; B2 failing after two deletes
+  gives `502`, leaves the rows and the session as they were, and a retry
+  finishes; an upload in flight gives `409`; the 11th try from one IP gives
+  `429`; no session gives `401`.
+- Headless Chrome, local server, a fresh account (id above 2, empty folder):
+  the lower-case word is refused in the page; a wrong password shows "your
+  password is wrong" inside the dialog and the session stays; the right ones
+  close the dialog, show the sign-in form, `me` is `401`, the row is gone and
+  the confirmation mail is logged; the same name signs up again with the next
+  id and "0 B of 500 MB". At 800 and 320 px nothing scrolls sideways.

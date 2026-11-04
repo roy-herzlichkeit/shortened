@@ -193,6 +193,19 @@
       <p class="hint">Changing it signs out every other session.</p>
       <button class="btn btn-ghost" type="submit">Change password</button>
     </form>
+
+    <form id="delete-form" class="form" novalidate>
+      <h3 class="danger-title">Delete account</h3>
+      <p class="hint">This deletes the account and every file in it, at once and for good. Premium, if you have it,
+        is lost with no refund. The username becomes free for anyone to take.</p>
+      <label for="delete-password">Password</label>
+      <input id="delete-password" name="password" type="password" autocomplete="current-password"
+             required minlength="8" maxlength="72">
+      <label for="delete-confirm">Type DELETE to confirm</label>
+      <input id="delete-confirm" name="confirm" type="text" autocomplete="off" spellcheck="false"
+             required maxlength="6">
+      <button class="btn btn-danger" type="submit">Delete my account</button>
+    </form>
     <p id="account-status" class="status" role="status" aria-live="polite"></p>
   </div>
 </dialog>

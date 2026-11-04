@@ -257,6 +257,14 @@ main {
 #verify-form, #address-form, #email-code-form, #password-form { margin-top: 14px; }
 #verify-form + #address-form, #email-code-form + #password-form,
 #email-change-form + #email-code-form + #password-form { border-top: 1px solid var(--line); padding-top: 14px; }
+#delete-form { margin-top: 14px; border-top: 1px solid var(--red); padding-top: 14px; }
+.danger-title {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--red);
+}
 
 /* ---------- Buttons ---------- */
 

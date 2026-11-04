@@ -62,6 +62,9 @@ const emailCode = $("email-code");
 const passwordForm = $("password-form");
 const currentPassword = $("current-password");
 const newPassword = $("new-password");
+const deleteForm = $("delete-form");
+const deletePassword = $("delete-password");
+const deleteConfirm = $("delete-confirm");
 const signupActions = $("signup-actions");
 const signupResend = $("signup-resend");
 const signupRestart = $("signup-restart");
@@ -566,6 +569,24 @@ function submitPassword(event) {
   });
 }
 
+function submitDelete(event) {
+  event.preventDefault();
+  if (deleteConfirm.value.trim() !== "DELETE") {
+    setStatus("Type DELETE, in capitals, to confirm.", "error");
+    return;
+  }
+  withButton(deleteForm, async () => {
+    await postJSON("/auth/account/delete", { password: deletePassword.value, confirm: deleteConfirm.value.trim() });
+    deletePassword.value = "";
+    deleteConfirm.value = "";
+    filesEl.replaceChildren();
+    closeAccount();
+    setMode("login");
+    showAuth();
+    setStatus("Account deleted, with every file in it. A confirmation mail is on its way.");
+  });
+}
+
 async function logout() {
   try {
     await postJSON("/auth/logout");
@@ -762,6 +783,7 @@ addressForm.addEventListener("submit", submitAddress);
 emailChangeForm.addEventListener("submit", submitEmailChange);
 emailCodeForm.addEventListener("submit", submitEmailCode);
 passwordForm.addEventListener("submit", submitPassword);
+deleteForm.addEventListener("submit", submitDelete);
 logoutButton.addEventListener("click", logout);
 signupResend.addEventListener("click", resendSignupCode);
 signupRestart.addEventListener("click", () => {

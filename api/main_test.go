@@ -557,10 +557,13 @@ type fakeB2 struct {
 	nextID   int
 	pageSize int  // ListObjectVersions entries per page
 	headFail bool // HEAD answers 500, as when B2 is unreachable
+	// deleteBudget, when >= 0, is how many more DELETEs succeed; after that
+	// they answer 500, as a B2 outage partway through would. -1: no limit.
+	deleteBudget int
 }
 
 func newFakeB2(t *testing.T) (*fakeB2, string) {
-	f := &fakeB2{versions: map[string][]fakeVersion{}, pageSize: 1000}
+	f := &fakeB2{versions: map[string][]fakeVersion{}, pageSize: 1000, deleteBudget: -1}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return f, srv.URL
@@ -597,6 +600,25 @@ func (f *fakeB2) setHeadFail(v bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.headFail = v
+}
+
+func (f *fakeB2) failDeletesAfter(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteBudget = n
+}
+
+// count is how many keys under prefix have any version or marker stored.
+func (f *fakeB2) count(prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for k, vs := range f.versions {
+		if strings.HasPrefix(k, prefix) && len(vs) > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *fakeB2) setPageSize(n int) {
@@ -725,6 +747,13 @@ func (f *fakeB2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/test-bucket/"):
 		key, _ := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/test-bucket/"))
+		if f.deleteBudget == 0 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if f.deleteBudget > 0 {
+			f.deleteBudget--
+		}
 		id := q.Get("versionId")
 		if id == "" {
 			f.versions[key] = append(f.versions[key], fakeVersion{id: f.newID(), modified: time.Now(), marker: true})
