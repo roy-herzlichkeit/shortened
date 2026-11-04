@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SHORTENED. email: the SES domain identity for shortened.herzlichkeit-zero.click
+  with Easy DKIM (2048-bit), its three DKIM CNAMEs and a DMARC record (p=none)
+  in the apex zone, and, while SES is in its sandbox, a verified test recipient.
+
+Parameters:
+  Domain:
+    Type: String
+    Default: shortened.herzlichkeit-zero.click
+    Description: The sending domain. Mail goes out as no-reply@<Domain>.
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Default: Z004479826BXL8T1YK32V
+    Description: The zone that holds Domain (herzlichkeit-zero.click). Records go under Domain only.
+  TestRecipient:
+    Type: String
+    Default: ""
+    Description: >-
+      An address to verify for testing while SES is in the sandbox (SES mails it
+      a link to click). Empty once production access is granted.
+
+Conditions:
+  HasTestRecipient: !Not [!Equals [!Ref TestRecipient, ""]]
+
+Resources:
+  DomainIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref Domain
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+      # Bounces and complaints come back by email to the sender, and
+      # no-reply@ has no mailbox. They still count in the SES account metrics.
+      FeedbackAttributes:
+        EmailForwardingEnabled: true
+
+  DkimRecord1:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName1
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords: [!GetAtt DomainIdentity.DkimDNSTokenValue1]
+
+  DkimRecord2:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName2
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords: [!GetAtt DomainIdentity.DkimDNSTokenValue2]
+
+  DkimRecord3:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt DomainIdentity.DkimDNSTokenName3
+      Type: CNAME
+      TTL: "1800"
+      ResourceRecords: [!GetAtt DomainIdentity.DkimDNSTokenValue3]
+
+  # DMARC passes through DKIM alignment (the From domain signs). p=none only
+  # reports; tighten it once mail has been flowing cleanly for a while.
+  DmarcRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub _dmarc.${Domain}
+      Type: TXT
+      TTL: "1800"
+      ResourceRecords: ['"v=DMARC1; p=none"']
+
+  TestRecipientIdentity:
+    Type: AWS::SES::EmailIdentity
+    Condition: HasTestRecipient
+    Properties:
+      EmailIdentity: !Ref TestRecipient
+
+Outputs:
+  FromAddress:
+    Value: !Sub no-reply@${Domain}
+  DomainIdentityArn:
+    Value: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${Domain}

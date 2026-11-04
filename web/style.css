@@ -236,6 +236,12 @@ main {
 .form .btn { margin-top: 10px; }
 
 .hint { margin: 8px 0 0; font-size: 15px; color: var(--muted); }
+.form-foot { margin: 16px 0 0; }
+.form > * { min-width: 0; }
+#email-row { gap: 6px; }
+#verify-form, #address-form, #email-code-form, #password-form { margin-top: 14px; }
+#verify-form + #address-form, #email-code-form + #password-form,
+#email-change-form + #email-code-form + #password-form { border-top: 1px solid var(--line); padding-top: 14px; }
 
 /* ---------- Buttons ---------- */
 

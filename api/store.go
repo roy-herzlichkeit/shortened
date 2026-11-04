@@ -19,12 +19,20 @@ import (
 // (confirmed_at is set once the object is seen in the bucket) or releases it
 // (the row goes at once). replaces names the file a "Replace" upload swaps out
 // when it is confirmed. syncFiles reconciles the ledger with the bucket.
+//
+// users.email is the verified address only (unique, case-insensitive, NULL
+// until verified); pending_email is an address waiting for its code. Keeping
+// them apart means an address nobody has proved they own can't block the
+// real owner from using it. otps holds one live code per account and purpose,
+// as a bcrypt hash; mail_log counts mails per account for the hourly limit.
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
 	username      TEXT    NOT NULL UNIQUE COLLATE NOCASE,
 	password_hash TEXT    NOT NULL,
-	created_at    INTEGER NOT NULL
+	created_at    INTEGER NOT NULL,
+	email         TEXT,
+	pending_email TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (
 	token_hash TEXT    PRIMARY KEY,
@@ -41,6 +49,20 @@ CREATE TABLE IF NOT EXISTS files (
 	replaces     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS files_user ON files(user_id);
+CREATE TABLE IF NOT EXISTS otps (
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	purpose    TEXT    NOT NULL,
+	target     TEXT    NOT NULL,
+	code_hash  TEXT    NOT NULL,
+	expires_at INTEGER NOT NULL,
+	tries      INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (user_id, purpose)
+);
+CREATE TABLE IF NOT EXISTS mail_log (
+	user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	sent_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mail_log_user ON mail_log(user_id, sent_at);
 `
 
 func openDB(path string) (*sql.DB, error) {
@@ -68,7 +90,63 @@ func openDB(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate files table: %w", err)
 	}
+	if err := migrateUsersEmail(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate users email: %w", err)
+	}
 	return db, nil
+}
+
+// columnsOf lists a table's column names.
+func columnsOf(db *sql.DB, table string) (map[string]bool, error) {
+	have := map[string]bool{}
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		have[name] = true
+	}
+	return have, rows.Err()
+}
+
+// migrateUsersEmail adds email and pending_email to a users table from before
+// v2 email, and the unique index on the verified address. Existing accounts
+// keep everything and start with no address; they are asked for one at their
+// next sign-in. Opening an already-migrated database does nothing.
+func migrateUsersEmail(db *sql.DB) error {
+	have, err := columnsOf(db, "users")
+	if err != nil {
+		return err
+	}
+	var added []string
+	for _, col := range []string{"email", "pending_email"} {
+		if have[col] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE users ADD COLUMN ` + col + ` TEXT`); err != nil { // #nosec G202 -- col is one of two literals above
+			return err
+		}
+		added = append(added, col)
+	}
+	// NULLs don't collide in a unique index, so accounts without an address
+	// are fine; two verified accounts can't share one, whatever the case.
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email COLLATE NOCASE)`); err != nil {
+		return err
+	}
+	if len(added) > 0 {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+			return err
+		}
+		log.Printf("migration: users table gained %s (%d existing users kept, no address yet)", strings.Join(added, ", "), n)
+	}
+	return nil
 }
 
 // migrateFilesColumns adds the ledger columns that came with confirm, release

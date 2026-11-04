@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,7 +41,67 @@ func testConfig(endpoint string) config {
 		bucket:       "test-bucket",
 		quotaBytes:   500 << 20,
 		cookieSecure: true,
+		mailLog:      true, // replaced by a fakeMailer in newTestServer
 	}
+}
+
+// fakeMailer keeps every message, for tests to read codes from.
+type fakeMailer struct {
+	mu   sync.Mutex
+	sent []message
+}
+
+func (f *fakeMailer) send(_ context.Context, m message) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, m)
+	return nil
+}
+
+var codeInText = regexp.MustCompile(`(?m)^    ([0-9]{6})$`)
+
+// mails returns the messages sent to addr so far, after waiting for any send
+// still in flight.
+func (s *server) mails(t *testing.T, addr string) []message {
+	t.Helper()
+	s.mailWG.Wait()
+	f := s.mailer.(*fakeMailer)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []message
+	for _, m := range f.sent {
+		if m.to == addr {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// lastCode is the code in the newest message to addr, or "" if it has none.
+func (s *server) lastCode(t *testing.T, addr string) string {
+	t.Helper()
+	ms := s.mails(t, addr)
+	if len(ms) == 0 {
+		return ""
+	}
+	m := codeInText.FindStringSubmatch(ms[len(ms)-1].text)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// servers maps each test handler to its server, so helpers that only get the
+// handler can still read the fake mailer.
+var servers sync.Map
+
+func serverOf(t *testing.T, h http.Handler) *server {
+	t.Helper()
+	s, ok := servers.Load(h)
+	if !ok {
+		t.Fatal("handler not built by newTestServer")
+	}
+	return s.(*server)
 }
 
 func TestMain(m *testing.M) {
@@ -63,7 +124,11 @@ func newTestServer(t *testing.T, cfg config) (*server, http.Handler) {
 	if err != nil {
 		t.Fatalf("newServer: %v", err)
 	}
-	return s, s.routes()
+	s.mailer = &fakeMailer{}
+	h := s.routes()
+	servers.Store(h, s)
+	t.Cleanup(func() { s.mailWG.Wait(); servers.Delete(h) })
+	return s, h
 }
 
 type reqOpt func(*http.Request)
@@ -84,9 +149,13 @@ func do(t *testing.T, h http.Handler, method, target, body string, opts ...reqOp
 	return rec
 }
 
+// creds is a sign-in body, and a sign-up body with the address
+// <user>@example.test (sign-in ignores the email field).
 func creds(user, pass string) string {
-	return fmt.Sprintf(`{"username":%q,"password":%q}`, user, pass)
+	return fmt.Sprintf(`{"username":%q,"password":%q,"email":%q}`, user, pass, emailOf(user))
 }
+
+func emailOf(user string) string { return strings.ToLower(user) + "@example.test" }
 
 func sessionFrom(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
 	t.Helper()
@@ -99,8 +168,21 @@ func sessionFrom(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
 	return nil
 }
 
-// signup registers a user and returns their session cookie.
+// signup registers a user, enters the code mailed to <user>@example.test, and
+// returns the session cookie of the now verified account.
 func signup(t *testing.T, h http.Handler, username string) *http.Cookie {
+	t.Helper()
+	c := signupUnverified(t, h, username)
+	code := serverOf(t, h).lastCode(t, emailOf(username))
+	if rec := do(t, h, http.MethodPost, "/auth/email/verify", fmt.Sprintf(`{"code":%q}`, code), withCookie(c)); rec.Code != http.StatusOK {
+		t.Fatalf("verify %s: status %d, body %s", username, rec.Code, rec.Body)
+	}
+	return c
+}
+
+// signupUnverified registers a user and returns the session cookie, without
+// entering the code.
+func signupUnverified(t *testing.T, h http.Handler, username string) *http.Cookie {
 	t.Helper()
 	rec := do(t, h, http.MethodPost, "/auth/signup", creds(username, "correct horse battery"))
 	if rec.Code != http.StatusCreated {
@@ -1050,13 +1132,13 @@ func TestLoadConfig(t *testing.T) {
 	set := func(env map[string]string) {
 		for _, k := range []string{"B2_KEY_ID", "B2_APP_KEY", "B2_ENDPOINT", "B2_REGION", "B2_BUCKET",
 			"PORT", "DB_PATH", "QUOTA_MB", "MAX_USERS", "COOKIE_SECURE", "TRUST_PROXY",
-			"TLS_CERT_FILE", "TLS_KEY_FILE"} {
+			"TLS_CERT_FILE", "TLS_KEY_FILE", "MAIL_FROM", "MAIL_LOG", "SES_REGION"} {
 			t.Setenv(k, env[k])
 		}
 	}
 	base := map[string]string{
 		"B2_KEY_ID": "id", "B2_APP_KEY": "key", "B2_ENDPOINT": testEndpoint,
-		"B2_REGION": "us-west-004", "B2_BUCKET": "b",
+		"B2_REGION": "us-west-004", "B2_BUCKET": "b", "MAIL_FROM": "no-reply@example.com",
 	}
 
 	set(base)
@@ -1065,7 +1147,8 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.port != "8080" || cfg.dbPath != "shortened.db" || cfg.quotaBytes != 500<<20 ||
-		cfg.maxUsers != 0 || !cfg.cookieSecure || cfg.trustProxy || cfg.tlsCert != "" || cfg.tlsKey != "" {
+		cfg.maxUsers != 0 || !cfg.cookieSecure || cfg.trustProxy || cfg.tlsCert != "" || cfg.tlsKey != "" ||
+		cfg.mailFrom != "no-reply@example.com" || cfg.mailLog || cfg.sesRegion != "us-east-1" {
 		t.Errorf("defaults = %+v", cfg)
 	}
 
@@ -1085,6 +1168,8 @@ func TestLoadConfig(t *testing.T) {
 		"negative users":   {"MAX_USERS", "-1"},
 		"cert without key": {"TLS_CERT_FILE", "/certs/cert.pem"},
 		"key without cert": {"TLS_KEY_FILE", "/certs/key.pem"},
+		"no mail at all":   {"MAIL_FROM", ""},
+		"bad sender":       {"MAIL_FROM", "No Reply <no-reply@example.com>"},
 	} {
 		env := map[string]string{}
 		for k, v := range base {

@@ -162,6 +162,16 @@ Resources:
                     route53:ChangeResourceRecordSetsNormalizedRecordNames:
                       - !Sub _acme-challenge.${SiteName}
                     route53:ChangeResourceRecordSetsRecordTypes: [TXT]
+              # Mail (email.yaml). Only as no-reply@; the boundary names the
+              # identities that may be used (the domain, plus the sandbox
+              # test recipient, since the sandbox authorises recipients too).
+              - Sid: SendMailAsNoReply
+                Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+                Condition:
+                  StringEquals:
+                    ses:FromAddress: no-reply@shortened.herzlichkeit-zero.click
       Tags:
         - { Key: Project, Value: shortened }
 

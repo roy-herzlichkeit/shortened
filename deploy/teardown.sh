@@ -2,10 +2,11 @@
 # Tears down SHORTENED. on AWS (us-east-1). Run it yourself in Git Bash with
 # your own admin profile, and only after the video and the grading.
 #
-#   bash deploy/teardown.sh                  # delete the 4 stacks, keep the final snapshot
+#   bash deploy/teardown.sh                  # delete the 5 stacks, keep the final snapshot
 #   bash deploy/teardown.sh delete-snapshot  # later: delete that final snapshot
 #
-# Order: shortened-staging, shortened-monitoring, shortened-backup, shortened.
+# Order: shortened-staging, shortened-email, shortened-monitoring,
+# shortened-backup, shortened.
 # The main stack's data volume has DeletionPolicy Snapshot, so a final snapshot
 # of /data (accounts, sessions, quota ledger) stays until you delete it on
 # purpose. Staging's data volume leaves a snapshot too; it holds test accounts
@@ -30,7 +31,8 @@ manual_steps() {
        --query 'RecoveryPoints[].[RecoveryPointArn,CreationDate]' --output table
      aws backup delete-recovery-point --backup-vault-name shortened-vault --recovery-point-arn <arn>   # each one
      aws backup delete-backup-vault --backup-vault-name shortened-vault
-2. SSM parameters /shortened/* and /shortened-staging/* (the B2 settings):
+2. SSM parameters /shortened/* and /shortened-staging/* (the B2 and mail settings):
+     aws ssm delete-parameters --names /shortened/MAIL_FROM /shortened-staging/MAIL_FROM
      aws ssm delete-parameters --names /shortened-staging/B2_KEY_ID /shortened-staging/B2_APP_KEY \\
        /shortened-staging/B2_ENDPOINT /shortened-staging/B2_REGION /shortened-staging/B2_BUCKET
      aws ssm delete-parameters --names /shortened/B2_KEY_ID /shortened/B2_APP_KEY \\
@@ -61,7 +63,7 @@ EOF
 
 case "${1:-stacks}" in
 stacks)
-  echo "This deletes the stacks shortened-staging, shortened-monitoring, shortened-backup and shortened."
+  echo "This deletes the stacks shortened-staging, shortened-email, shortened-monitoring, shortened-backup and shortened."
   echo "The site goes offline. The data volume leaves a final snapshot."
   read -r -p 'Type "teardown" to go on: ' answer
   [ "$answer" = teardown ] || { echo "stopped, nothing deleted"; exit 1; }
@@ -73,7 +75,7 @@ stacks)
   svol=$(aws cloudformation describe-stacks --stack-name shortened-staging \
         --query "Stacks[0].Outputs[?OutputKey=='DataVolumeId'].OutputValue" --output text 2>/dev/null || true)
 
-  for s in shortened-staging shortened-monitoring shortened-backup shortened; do
+  for s in shortened-staging shortened-email shortened-monitoring shortened-backup shortened; do
     if ! aws cloudformation describe-stacks --stack-name "$s" >/dev/null 2>&1; then
       echo "skip   $s (not found)"; continue
     fi

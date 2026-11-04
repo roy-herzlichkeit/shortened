@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -54,6 +55,9 @@ type config struct {
 	trustProxy   bool
 	tlsCert      string // PEM file; with tlsKey, the server speaks HTTPS
 	tlsKey       string
+	mailFrom     string // sender address; SES is used when set
+	mailLog      bool   // no SES: write mails (codes included) to the log
+	sesRegion    string
 }
 
 func loadConfig() (config, error) {
@@ -69,6 +73,20 @@ func loadConfig() (config, error) {
 		trustProxy:   os.Getenv("TRUST_PROXY") == "true",
 		tlsCert:      os.Getenv("TLS_CERT_FILE"),
 		tlsKey:       os.Getenv("TLS_KEY_FILE"),
+		mailFrom:     os.Getenv("MAIL_FROM"),
+		mailLog:      os.Getenv("MAIL_LOG") == "true",
+		sesRegion:    envOr("SES_REGION", "us-east-1"),
+	}
+
+	// Sign-up and password reset need mail. Refusing to start beats an app
+	// whose codes silently go nowhere.
+	if cfg.mailFrom == "" && !cfg.mailLog {
+		return config{}, errors.New("set MAIL_FROM to send mail through SES, or MAIL_LOG=true (local and CI only) to log it")
+	}
+	if cfg.mailFrom != "" {
+		if _, err := normalizeEmail(cfg.mailFrom); err != nil {
+			return config{}, errors.New("MAIL_FROM must be a plain address like no-reply@example.com")
+		}
 	}
 
 	// One without the other is a broken deploy, not a request for plain HTTP.
@@ -116,6 +134,8 @@ type server struct {
 	client  *s3.Client
 	presign *s3.PresignClient
 	limiter *ipLimiter
+	mailer  mailer
+	mailWG  sync.WaitGroup // mails still being sent, waited for at shutdown
 }
 
 func newServer(ctx context.Context, cfg config, db *sql.DB) (*server, error) {
@@ -142,6 +162,13 @@ func newServer(ctx context.Context, cfg config, db *sql.DB) (*server, error) {
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 
+	var m mailer = logMailer{}
+	if cfg.mailFrom != "" {
+		if m, err = newSESMailer(ctx, cfg.sesRegion, cfg.mailFrom); err != nil {
+			return nil, err
+		}
+	}
+
 	return &server{
 		cfg:     cfg,
 		db:      db,
@@ -149,6 +176,7 @@ func newServer(ctx context.Context, cfg config, db *sql.DB) (*server, error) {
 		presign: s3.NewPresignClient(client),
 		// 10 attempts at once, then one every 6 seconds, per client IP.
 		limiter: newIPLimiter(6*time.Second, 10),
+		mailer:  m,
 	}, nil
 }
 
@@ -161,11 +189,19 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/auth/logout", noStore(s.sameOrigin(http.HandlerFunc(s.handleLogout))))
 	mux.Handle("/auth/me", noStore(s.requireUser(s.handleMe)))
 
-	mux.Handle("/upload-url", noStore(s.requireUser(s.handleUploadURL)))
-	mux.Handle("/files", noStore(s.requireUser(s.handleFiles)))
-	mux.Handle("/files/confirm", noStore(s.requireUser(s.handleConfirm)))
-	mux.Handle("/files/release", noStore(s.requireUser(s.handleRelease)))
-	mux.Handle("/download-url", noStore(s.requireUser(s.handleDownloadURL)))
+	// Codes and passwords: the same per-IP limit as sign-in.
+	mux.Handle("/auth/forgot", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleForgot)))))
+	mux.Handle("/auth/reset", noStore(s.rateLimited(s.sameOrigin(http.HandlerFunc(s.handleReset)))))
+	mux.Handle("/auth/email", noStore(s.rateLimited(s.requireUser(s.handleSetEmail))))
+	mux.Handle("/auth/email/verify", noStore(s.rateLimited(s.requireUser(s.handleVerifyEmail))))
+	mux.Handle("/auth/password", noStore(s.rateLimited(s.requireUser(s.handleChangePassword))))
+
+	// Files need a verified address.
+	mux.Handle("/upload-url", noStore(s.requireVerified(s.handleUploadURL)))
+	mux.Handle("/files", noStore(s.requireVerified(s.handleFiles)))
+	mux.Handle("/files/confirm", noStore(s.requireVerified(s.handleConfirm)))
+	mux.Handle("/files/release", noStore(s.requireVerified(s.handleRelease)))
+	mux.Handle("/download-url", noStore(s.requireVerified(s.handleDownloadURL)))
 
 	mux.Handle("/", s.pageHandler())
 	return mux
@@ -256,8 +292,12 @@ func main() {
 		if cfg.tlsCert != "" {
 			scheme = "https"
 		}
-		log.Printf("listening on :%s, %s (bucket %q, database %q, quota %d MB)",
-			cfg.port, scheme, cfg.bucket, cfg.dbPath, cfg.quotaBytes>>20)
+		mail := "SES as " + cfg.mailFrom
+		if cfg.mailFrom == "" {
+			mail = "log only (MAIL_LOG)"
+		}
+		log.Printf("listening on :%s, %s (bucket %q, database %q, quota %d MB, mail %s)",
+			cfg.port, scheme, cfg.bucket, cfg.dbPath, cfg.quotaBytes>>20, mail)
 		serveErr <- serve(srv, ln, cfg)
 	}()
 
@@ -274,6 +314,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+	s.mailWG.Wait() // each send has its own 30 s timeout
 }
 
 func newHTTPServer(cfg config, h http.Handler) *http.Server {

@@ -43,9 +43,14 @@
       </div>
 
       <form id="auth-form" class="form" novalidate>
-        <label for="username">Username</label>
+        <label id="username-label" for="username">Username or email</label>
         <input id="username" name="username" type="text" autocomplete="username" spellcheck="false"
-               required minlength="3" maxlength="32" pattern="[A-Za-z0-9_\-]+">
+               required maxlength="254">
+
+        <div id="email-row" class="form" hidden>
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="email" spellcheck="false" maxlength="254">
+        </div>
 
         <label for="password">Password</label>
         <input id="password" name="password" type="password" autocomplete="current-password"
@@ -53,6 +58,53 @@
 
         <p id="auth-hint" class="hint">Welcome back, choom.</p>
         <button id="auth-submit" class="btn btn-primary" type="submit">Sign in</button>
+      </form>
+      <p class="form-foot"><button id="forgot-open" class="btn btn-ghost btn-small" type="button">Forgot password?</button></p>
+    </div>
+  </section>
+
+  <section id="forgot-view" class="frame" aria-labelledby="forgot-title" hidden>
+    <div class="frame-inner">
+      <h2 id="forgot-title" class="frame-title"><span class="tag">01</span> Reset password</h2>
+
+      <form id="forgot-form" class="form" novalidate>
+        <label for="forgot-login">Username or email</label>
+        <input id="forgot-login" name="login" type="text" autocomplete="username" spellcheck="false" required maxlength="254">
+        <p class="hint">If the account has a confirmed email address, we mail a 6-digit code to it.</p>
+        <button class="btn btn-primary" type="submit">Send code</button>
+      </form>
+
+      <form id="reset-form" class="form" novalidate hidden>
+        <label for="reset-code">Code from the email</label>
+        <input id="reset-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+               required minlength="6" maxlength="6" pattern="[0-9]{6}">
+        <label for="reset-password">New password</label>
+        <input id="reset-password" name="password" type="password" autocomplete="new-password"
+               required minlength="8" maxlength="72">
+        <p class="hint">8-72 characters. Resetting signs out every other session.</p>
+        <button class="btn btn-primary" type="submit">Set new password</button>
+      </form>
+      <p class="form-foot"><button id="forgot-back" class="btn btn-ghost btn-small" type="button">Back to sign in</button></p>
+    </div>
+  </section>
+
+  <section id="verify-view" class="frame" aria-labelledby="verify-title" hidden>
+    <div class="frame-inner">
+      <h2 id="verify-title" class="frame-title"><span class="tag">01</span> Confirm your email</h2>
+      <p id="verify-text" class="hint"></p>
+
+      <form id="verify-form" class="form" novalidate>
+        <label for="verify-code">Code from the email</label>
+        <input id="verify-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+               required minlength="6" maxlength="6" pattern="[0-9]{6}">
+        <button class="btn btn-primary" type="submit">Confirm</button>
+      </form>
+
+      <form id="address-form" class="form" novalidate>
+        <label for="address">Email address</label>
+        <input id="address" name="email" type="email" autocomplete="email" spellcheck="false" required maxlength="254">
+        <p class="hint">A code works for 10 minutes. At most 3 codes an hour.</p>
+        <button id="address-submit" class="btn btn-ghost" type="submit">Send code</button>
       </form>
     </div>
   </section>
@@ -95,6 +147,40 @@
           <button id="refresh" class="btn btn-ghost btn-small" type="button">Refresh</button>
         </div>
         <ul id="files" class="files"><li class="empty">Loading…</li></ul>
+      </div>
+    </div>
+
+    <div class="frame">
+      <div class="frame-inner">
+        <h2 class="frame-title"><span class="tag">04</span> Account</h2>
+        <p class="hint">Email: <span id="account-email" class="mono"></span></p>
+
+        <form id="email-change-form" class="form" novalidate>
+          <label for="new-email">New email</label>
+          <input id="new-email" name="email" type="email" autocomplete="email" spellcheck="false" required maxlength="254">
+          <label for="email-change-password">Current password</label>
+          <input id="email-change-password" name="password" type="password" autocomplete="current-password"
+                 required minlength="8" maxlength="72">
+          <button class="btn btn-ghost" type="submit">Send code</button>
+        </form>
+
+        <form id="email-code-form" class="form" novalidate hidden>
+          <label for="email-code">Code sent to <span id="email-code-target"></span></label>
+          <input id="email-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                 required minlength="6" maxlength="6" pattern="[0-9]{6}">
+          <button class="btn btn-primary" type="submit">Confirm new address</button>
+        </form>
+
+        <form id="password-form" class="form" novalidate>
+          <label for="current-password">Current password</label>
+          <input id="current-password" name="current" type="password" autocomplete="current-password"
+                 required minlength="8" maxlength="72">
+          <label for="new-password">New password</label>
+          <input id="new-password" name="password" type="password" autocomplete="new-password"
+                 required minlength="8" maxlength="72">
+          <p class="hint">Changing it signs out every other session.</p>
+          <button class="btn btn-ghost" type="submit">Change password</button>
+        </form>
       </div>
     </div>
   </section>
