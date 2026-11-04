@@ -18,6 +18,7 @@
   <div id="account" class="account" hidden>
     <span class="account-label">User</span>
     <span id="whoami" class="account-name"></span>
+    <button id="account-open" class="btn btn-ghost btn-small" type="button" aria-haspopup="dialog" hidden>Account</button>
     <button id="logout" class="btn btn-ghost btn-small" type="button">Sign out</button>
   </div>
 </header>
@@ -106,6 +107,11 @@
         <p class="hint">A code works for 10 minutes. At most 3 codes an hour.</p>
         <button id="address-submit" class="btn btn-ghost" type="submit">Send code</button>
       </form>
+
+      <div id="signup-actions" class="form-foot dialog-actions" hidden>
+        <button id="signup-resend" class="btn btn-ghost btn-small" type="button">Send a new code</button>
+        <button id="signup-restart" class="btn btn-ghost btn-small" type="button">Start over</button>
+      </div>
     </div>
   </section>
 
@@ -149,44 +155,48 @@
         <ul id="files" class="files"><li class="empty">Loading…</li></ul>
       </div>
     </div>
-
-    <div class="frame">
-      <div class="frame-inner">
-        <h2 class="frame-title"><span class="tag">04</span> Account</h2>
-        <p class="hint">Email: <span id="account-email" class="mono"></span></p>
-
-        <form id="email-change-form" class="form" novalidate>
-          <label for="new-email">New email</label>
-          <input id="new-email" name="email" type="email" autocomplete="email" spellcheck="false" required maxlength="254">
-          <label for="email-change-password">Current password</label>
-          <input id="email-change-password" name="password" type="password" autocomplete="current-password"
-                 required minlength="8" maxlength="72">
-          <button class="btn btn-ghost" type="submit">Send code</button>
-        </form>
-
-        <form id="email-code-form" class="form" novalidate hidden>
-          <label for="email-code">Code sent to <span id="email-code-target"></span></label>
-          <input id="email-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
-                 required minlength="6" maxlength="6" pattern="[0-9]{6}">
-          <button class="btn btn-primary" type="submit">Confirm new address</button>
-        </form>
-
-        <form id="password-form" class="form" novalidate>
-          <label for="current-password">Current password</label>
-          <input id="current-password" name="current" type="password" autocomplete="current-password"
-                 required minlength="8" maxlength="72">
-          <label for="new-password">New password</label>
-          <input id="new-password" name="password" type="password" autocomplete="new-password"
-                 required minlength="8" maxlength="72">
-          <p class="hint">Changing it signs out every other session.</p>
-          <button class="btn btn-ghost" type="submit">Change password</button>
-        </form>
-      </div>
-    </div>
   </section>
 
   <p id="status" class="status" role="status" aria-live="polite"></p>
 </main>
+
+<dialog id="account-dialog" class="dialog dialog-wide" aria-labelledby="account-title">
+  <div class="frame-inner">
+    <div class="list-head">
+      <h2 id="account-title" class="frame-title"><span class="tag">04</span> Account</h2>
+      <button id="account-close" class="btn btn-ghost btn-small" type="button">Close</button>
+    </div>
+    <p class="hint">Email: <span id="account-email" class="mono"></span></p>
+
+    <form id="email-change-form" class="form" novalidate>
+      <label for="new-email">New email</label>
+      <input id="new-email" name="email" type="email" autocomplete="email" spellcheck="false" required maxlength="254">
+      <label for="email-change-password">Current password</label>
+      <input id="email-change-password" name="password" type="password" autocomplete="current-password"
+             required minlength="8" maxlength="72">
+      <button class="btn btn-ghost" type="submit">Send code</button>
+    </form>
+
+    <form id="email-code-form" class="form" novalidate hidden>
+      <label for="email-code">Code sent to <span id="email-code-target"></span></label>
+      <input id="email-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+             required minlength="6" maxlength="6" pattern="[0-9]{6}">
+      <button class="btn btn-primary" type="submit">Confirm new address</button>
+    </form>
+
+    <form id="password-form" class="form" novalidate>
+      <label for="current-password">Current password</label>
+      <input id="current-password" name="current" type="password" autocomplete="current-password"
+             required minlength="8" maxlength="72">
+      <label for="new-password">New password</label>
+      <input id="new-password" name="password" type="password" autocomplete="new-password"
+             required minlength="8" maxlength="72">
+      <p class="hint">Changing it signs out every other session.</p>
+      <button class="btn btn-ghost" type="submit">Change password</button>
+    </form>
+    <p id="account-status" class="status" role="status" aria-live="polite"></p>
+  </div>
+</dialog>
 
 <dialog id="conflict" class="dialog" aria-labelledby="conflict-title">
   <form method="dialog" class="frame-inner">
