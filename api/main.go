@@ -136,6 +136,13 @@ type server struct {
 	limiter *ipLimiter
 	mailer  mailer
 	mailWG  sync.WaitGroup // mails still being sent, waited for at shutdown
+
+	// syncedAt holds, per user id, when the ledger was last checked against
+	// the bucket (a time.Time), so /auth/me doesn't list the bucket on every call.
+	syncedAt sync.Map
+	// meSync turns that check on. It is off only in tests with no bucket to
+	// list, which must not reach the network.
+	meSync bool
 }
 
 func newServer(ctx context.Context, cfg config, db *sql.DB) (*server, error) {
@@ -177,6 +184,7 @@ func newServer(ctx context.Context, cfg config, db *sql.DB) (*server, error) {
 		// 10 attempts at once, then one every 6 seconds, per client IP.
 		limiter: newIPLimiter(6*time.Second, 10),
 		mailer:  m,
+		meSync:  true,
 	}, nil
 }
 

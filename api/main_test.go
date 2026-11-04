@@ -130,6 +130,9 @@ func newTestServer(t *testing.T, cfg config) (*server, http.Handler) {
 		t.Fatalf("newServer: %v", err)
 	}
 	s.mailer = &fakeMailer{}
+	// testEndpoint is the real B2 host with fake keys: tests using it only
+	// sign URLs locally, so /auth/me must not list the bucket there.
+	s.meSync = cfg.endpoint != testEndpoint
 	h := s.routes()
 	servers.Store(h, s)
 	t.Cleanup(func() { s.mailWG.Wait(); servers.Delete(h) })

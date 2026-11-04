@@ -27,6 +27,9 @@ import (
 // just before the link expired.
 const ledgerGrace = linkTTL + 15*time.Minute
 
+// syncEvery is how stale the ledger may be when /auth/me reports usage.
+const syncEvery = 30 * time.Second
+
 type uploadRequest struct {
 	Filename string `json:"filename"`
 	Size     int64  `json:"size"`
@@ -273,6 +276,27 @@ type rowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// storageUsage splits the ledger into bytes stored (confirmed in the bucket)
+// and bytes reserved by upload links not yet confirmed. The quota counts both.
+func (s *server) storageUsage(ctx context.Context, userID int64) (stored, reserved int64, err error) {
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(CASE WHEN confirmed_at > 0 THEN size ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN confirmed_at = 0 THEN size ELSE 0 END), 0)
+		FROM files WHERE user_id = ?`, userID).Scan(&stored, &reserved)
+	return stored, reserved, err
+}
+
+// syncIfStale runs syncFiles unless the ledger was checked against the bucket
+// in the last syncEvery. A failure is logged and the ledger is used as it is.
+func (s *server) syncIfStale(ctx context.Context, userID int64) {
+	if t, ok := s.syncedAt.Load(userID); ok && time.Since(t.(time.Time)) < syncEvery {
+		return
+	}
+	if _, err := s.syncFiles(ctx, userID); err != nil {
+		log.Printf("sync files for user %d: %v", userID, err)
+	}
+}
+
 func (s *server) usedBytes(ctx context.Context, q rowQuerier, userID int64) (int64, error) {
 	var used int64
 	err := q.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM files WHERE user_id = ?`, userID).Scan(&used)
@@ -302,7 +326,8 @@ type bucketObject struct {
 func (s *server) syncFiles(ctx context.Context, userID int64) ([]bucketObject, error) {
 	// A row confirmed while this listing ran may be missing from it; only rows
 	// confirmed before the listing started are judged by it.
-	listStart := time.Now().Unix()
+	started := time.Now()
+	listStart := started.Unix()
 	var objects []bucketObject
 	pages := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.cfg.bucket),
@@ -353,6 +378,7 @@ func (s *server) syncFiles(ctx context.Context, userID int64) ([]bucketObject, e
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	s.syncedAt.Store(userID, started)
 
 	// Finish "Replace" uploads whose new object is in the bucket. Outside the
 	// transaction: it talks to the bucket, and it uses s.db itself.
@@ -461,20 +487,25 @@ func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
 }
 
 // usageResponse is what confirm and release answer, so the page can redraw the
-// usage bar without another request.
+// usage bar without another request. usedBytes = storedBytes + reservedBytes,
+// which is what the quota checks.
 type usageResponse struct {
-	UsedBytes  int64 `json:"usedBytes"`
-	QuotaBytes int64 `json:"quotaBytes"`
+	UsedBytes     int64 `json:"usedBytes"`
+	StoredBytes   int64 `json:"storedBytes"`
+	ReservedBytes int64 `json:"reservedBytes"`
+	QuotaBytes    int64 `json:"quotaBytes"`
 }
 
 func (s *server) writeUsage(w http.ResponseWriter, r *http.Request, userID int64) {
-	used, err := s.usedBytes(r.Context(), s.db, userID)
+	stored, reserved, err := s.storageUsage(r.Context(), userID)
 	if err != nil {
 		log.Printf("usage for user %d: %v", userID, err)
 		writeError(w, http.StatusInternalServerError, "could not read your storage usage")
 		return
 	}
-	writeJSON(w, http.StatusOK, usageResponse{UsedBytes: used, QuotaBytes: s.cfg.quotaBytes})
+	writeJSON(w, http.StatusOK, usageResponse{
+		UsedBytes: stored + reserved, StoredBytes: stored, ReservedBytes: reserved, QuotaBytes: s.cfg.quotaBytes,
+	})
 }
 
 // pendingRow reads the caller's ledger row for key. ok is false when there is

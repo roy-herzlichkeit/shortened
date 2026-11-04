@@ -76,6 +76,7 @@ let verifyMode = "account";
 let quota = { used: 0, total: 0 };
 let currentFiles = [];
 let activeUpload = null; // the XHR of the upload in progress, for Cancel
+let activeKey = null; // its reserved key, released if the tab closes mid-upload
 
 // While the Account dialog is open, messages go to its own line, since the
 // page's status line is behind the backdrop.
@@ -250,7 +251,7 @@ function showApp(me) {
   account.hidden = false;
   whoami.disabled = false; // the name opens the Account pop-up
   whoami.textContent = me.username;
-  renderUsage(me.usedBytes, me.quotaBytes);
+  renderUsage(me);
   renderAccount(me);
 }
 
@@ -290,12 +291,20 @@ function setMode(next) {
     : "Welcome back, choom.";
 }
 
-function renderUsage(used, total) {
-  quota = { used: used, total: total };
-  const pct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
-  usageText.textContent = formatSize(used) + " of " + formatSize(total);
+// renderUsage draws the meter from a usage answer ({usedBytes, storedBytes,
+// reservedBytes, quotaBytes}). The bar and the figure are what the bucket
+// holds; space held for an upload still in flight is shown apart, since the
+// quota counts it but B2 doesn't have it yet.
+function renderUsage(u) {
+  const total = u.quotaBytes;
+  const stored = u.storedBytes != null ? u.storedBytes : u.usedBytes;
+  const reserved = u.reservedBytes || 0;
+  quota = { used: stored + reserved, total: total };
+  const pct = total > 0 ? Math.min(100, (stored / total) * 100) : 0;
+  usageText.textContent = formatSize(stored) + " of " + formatSize(total) +
+    (reserved > 0 ? " · " + formatSize(reserved) + " uploading" : "");
   usageBar.style.width = pct + "%";
-  usage.classList.toggle("is-full", pct >= 90);
+  usage.classList.toggle("is-full", total > 0 && (stored + reserved) / total >= 0.9);
 }
 
 function renderFiles(files) {
@@ -367,7 +376,7 @@ async function refresh() {
 
 async function refreshUsage() {
   const me = await api("/auth/me");
-  renderUsage(me.usedBytes, me.quotaBytes);
+  renderUsage(me);
 }
 
 // After an error the ledger may have changed (a reservation released, a
@@ -434,7 +443,14 @@ async function submitAuth(event) {
   } finally {
     authSubmit.disabled = false;
   }
-  await start();
+  await // Closing or leaving the tab mid-upload: hand the reservation back so it
+// doesn't count for its whole window. sendBeacon outlives the page; if the
+// bytes did land, the server keeps the file anyway.
+window.addEventListener("pagehide", () => {
+  if (activeKey) navigator.sendBeacon("/files/release?key=" + encodeURIComponent(activeKey));
+});
+
+start();
 }
 
 // withButton disables a form's submit button while fn runs.
@@ -469,7 +485,14 @@ function submitVerify(event) {
       await postJSON("/auth/email/verify", { code });
       setStatus("Email confirmed. Jacked in.");
     }
-    await start();
+    await // Closing or leaving the tab mid-upload: hand the reservation back so it
+// doesn't count for its whole window. sendBeacon outlives the page; if the
+// bytes did land, the server keeps the file anyway.
+window.addEventListener("pagehide", () => {
+  if (activeKey) navigator.sendBeacon("/files/release?key=" + encodeURIComponent(activeKey));
+});
+
+start();
   });
 }
 
@@ -517,7 +540,14 @@ function submitReset(event) {
     resetCode.value = "";
     resetPassword.value = "";
     setStatus("Password changed. Every other session is signed out.");
-    await start();
+    await // Closing or leaving the tab mid-upload: hand the reservation back so it
+// doesn't count for its whole window. sendBeacon outlives the page; if the
+// bytes did land, the server keeps the file anyway.
+window.addEventListener("pagehide", () => {
+  if (activeKey) navigator.sendBeacon("/files/release?key=" + encodeURIComponent(activeKey));
+});
+
+start();
   });
 }
 
@@ -697,6 +727,7 @@ async function upload() {
     setStatus("Uploading " + signed.name + "…");
     progressBar.style.width = "0%";
     progress.hidden = false;
+    activeKey = signed.key;
     try {
       await putWithProgress(signed.url, file);
     } catch (err) {
@@ -708,7 +739,7 @@ async function upload() {
 
     setStatus("Checking the upload…");
     const usage = await api("/files/confirm?key=" + encodeURIComponent(signed.key), { method: "POST" });
-    renderUsage(usage.usedBytes, usage.quotaBytes);
+    renderUsage(usage);
 
     fileInput.value = "";
     fileName.textContent = "No file selected";
@@ -719,6 +750,7 @@ async function upload() {
     else handleError(err);
     refreshQuietly();
   } finally {
+    activeKey = null;
     progress.hidden = true;
     uploadButton.disabled = false;
   }
@@ -727,7 +759,7 @@ async function upload() {
 async function releaseUpload(key) {
   try {
     const usage = await api("/files/release?key=" + encodeURIComponent(key), { method: "POST" });
-    renderUsage(usage.usedBytes, usage.quotaBytes);
+    renderUsage(usage);
   } catch (_) {
     // The reservation still lapses on its own; the refresh after the error
     // shows whatever the server has.
@@ -771,6 +803,13 @@ refreshButton.addEventListener("click", () => refresh().catch(handleError));
 fileInput.addEventListener("change", () => {
   const file = fileInput.files[0];
   fileName.textContent = file ? file.name + " · " + formatSize(file.size) : "No file selected";
+});
+
+// Closing or leaving the tab mid-upload: hand the reservation back so it
+// doesn't count for its whole window. sendBeacon outlives the page; if the
+// bytes did land, the server keeps the file anyway.
+window.addEventListener("pagehide", () => {
+  if (activeKey) navigator.sendBeacon("/files/release?key=" + encodeURIComponent(activeKey));
 });
 
 start();
