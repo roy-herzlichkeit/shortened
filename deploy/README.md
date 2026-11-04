@@ -220,6 +220,36 @@ instance role has `CloudWatchAgentServerPolicy` (the role is updated in place;
 After an AMI upgrade, update `InstanceId` in this stack and in
 `shortened-backup`.
 
+## Staging (`shortened-staging`)
+
+The same template, deployed a second time as a throwaway copy for testing at
+`https://staging.shortened.herzlichkeit-zero.click`. New features go to
+staging first; the agent may create test accounts there, never on live.
+
+| Parameter | Staging value |
+| --- | --- |
+| `Env` | `shortened-staging` (SSM `/shortened-staging/*`, role, profile, SG and Name tags) |
+| `InstanceType` | `t4g.micro` |
+| `SiteName` | `staging.shortened.herzlichkeit-zero.click` |
+| `CertificateArn` | the staging ACM certificate (`5df63273-…`), DNS-validated with one CNAME in the apex zone |
+| `PinnedImageId` | the same AMI as live |
+
+Live keeps the defaults (`Env=shortened`, `t4g.small`); adding these two
+parameters made no change to the live stack.
+
+- B2: bucket `shortened-staging` (private, CORS for the staging origin only)
+  with its own key `shortened-staging-app`, limited to that bucket.
+- SSM: `bash .agent/aws/ssm/put-ssm-params-staging.sh` (asks for the key at a
+  hidden prompt).
+- The boundary (v5) lets certbot write `_acme-challenge.staging.shortened…`.
+- No backup plan or alarms: staging holds test data only.
+- Cost: about $6/month for the t4g.micro plus $3.65 for its IPv4 (the free
+  trial covers only one t4g instance). **Stop the instance when you are not
+  testing.**
+- New app version: the same Session Manager rebuild as live, on the staging
+  instance.
+- `deploy/teardown.sh` deletes staging first.
+
 ## Delete
 
 `DeleteStack` (turn termination protection off first). Ask first: this
