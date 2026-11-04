@@ -443,14 +443,7 @@ async function submitAuth(event) {
   } finally {
     authSubmit.disabled = false;
   }
-  await // Closing or leaving the tab mid-upload: hand the reservation back so it
-// doesn't count for its whole window. sendBeacon outlives the page; if the
-// bytes did land, the server keeps the file anyway.
-window.addEventListener("pagehide", () => {
-  if (activeKey) navigator.sendBeacon("/files/release?key=" + encodeURIComponent(activeKey));
-});
-
-start();
+  await start();
 }
 
 // withButton disables a form's submit button while fn runs.
@@ -485,14 +478,7 @@ function submitVerify(event) {
       await postJSON("/auth/email/verify", { code });
       setStatus("Email confirmed. Jacked in.");
     }
-    await // Closing or leaving the tab mid-upload: hand the reservation back so it
-// doesn't count for its whole window. sendBeacon outlives the page; if the
-// bytes did land, the server keeps the file anyway.
-window.addEventListener("pagehide", () => {
-  if (activeKey) navigator.sendBeacon("/files/release?key=" + encodeURIComponent(activeKey));
-});
-
-start();
+    await start();
   });
 }
 
@@ -540,14 +526,7 @@ function submitReset(event) {
     resetCode.value = "";
     resetPassword.value = "";
     setStatus("Password changed. Every other session is signed out.");
-    await // Closing or leaving the tab mid-upload: hand the reservation back so it
-// doesn't count for its whole window. sendBeacon outlives the page; if the
-// bytes did land, the server keeps the file anyway.
-window.addEventListener("pagehide", () => {
-  if (activeKey) navigator.sendBeacon("/files/release?key=" + encodeURIComponent(activeKey));
-});
-
-start();
+    await start();
   });
 }
 
