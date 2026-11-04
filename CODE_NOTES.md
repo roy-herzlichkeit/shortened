@@ -34,7 +34,7 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | `GET /auth/signup/pending` | `signup` cookie | `200 {"username","pendingEmail"}` or `404`; lets the page pick a sign-up back up after a reload. |
 | `POST /auth/login` | none, rate-limited | `{"username","password"}`, where `username` may also be the verified email → `200`, sets the session cookie. |
 | `POST /auth/logout` | cookie | Ends this session → `204`. |
-| `GET /auth/me` | cookie | `{"username","email","pendingEmail","verified","usedBytes","quotaBytes"}`. |
+| `GET /auth/me` | cookie | `{"username","email","pendingEmail","verified","usedBytes","storedBytes","reservedBytes","quotaBytes"}`. First checks the ledger against the bucket (at most every 30 s per user), so `storedBytes` is what B2 holds; `reservedBytes` is held by upload links not yet confirmed; `usedBytes` is their sum, which the quota counts. |
 | `POST /auth/email` | cookie, rate-limited | `{"email","password"}` → `202 {"pendingEmail"}`: mails a code to the address (first address, a new code, or a change; a change needs the password, else `403`). Over 3 mails an hour → `429`. |
 | `POST /auth/email/verify` | cookie, rate-limited | `{"code"}` → `200 {"email"}`: the pending address becomes the account's. Wrong or expired → `400`. |
 | `POST /auth/forgot` | none, rate-limited | `{"login"}` (username or email) → always `202` with the same message; a code goes to the verified address if there is one. |
@@ -430,6 +430,24 @@ Not run:
 - The Docker image has not been rebuilt locally (Docker Desktop was not
   running). CI builds it and runs the smoke test.
 - Nothing has been deployed anywhere other than localhost.
+
+**Usage that matches the bucket**, on 2026-11-04:
+
+- Before, the meter was the ledger total as last reconciled, reservations
+  included, and `/auth/me` never looked at B2. So a file removed outside the
+  app, or an upload cut off when the tab closed, could show as used for up to
+  25 minutes. Now `/auth/me` reconciles first (throttled to once per 30 s per
+  user), the meter shows stored bytes with reserved ones apart ("· 3 MB
+  uploading"), and the page releases its reservation with `sendBeacon` when
+  the tab is closed mid-upload.
+- `TestMeMatchesBucket`: a file dropped from the fake bucket stops counting
+  through `/auth/me` alone once the check is due; stored and reserved are
+  reported apart by `/auth/me`, confirm and release. Unit tests that use the
+  real B2 host with fake keys keep `/auth/me` from listing, so they stay
+  offline.
+- Headless Chrome, local server: a signed link with nothing uploaded shows
+  "0 B of 500 MB · 3 MB uploading"; leaving the page with it active brings
+  the meter back to "0 B of 500 MB"; no script errors.
 
 **Account created only after the code, Account as a pop-up**, on 2026-11-04:
 

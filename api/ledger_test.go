@@ -358,3 +358,41 @@ func TestUploadNameRules(t *testing.T) {
 		t.Errorf("unknown onConflict: status %d, want 400", rec.Code)
 	}
 }
+
+// /auth/me checks the ledger against the bucket before reporting usage, so
+// the meter shows what B2 really holds, and it reports stored and reserved
+// bytes apart.
+func TestMeMatchesBucket(t *testing.T) {
+	b2, endpoint := newFakeB2(t)
+	s, h := newTestServer(t, testConfig(endpoint))
+	c := signup(t, h, "alice")
+	var id int64
+	if err := s.db.QueryRow(`SELECT id FROM users WHERE username = 'alice'`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+
+	stores(t, h, b2, c, "kept.txt", 100)
+	gone := stores(t, h, b2, c, "gone.txt", 2000)
+	mustUpload(t, h, c, "pending.txt", 300, "") // a link signed, nothing uploaded yet
+	b2.drop(gone)
+	agoLedger(t, s)
+
+	// Within syncEvery of the last check the ledger is used as it is.
+	me := decode[meResponse](t, do(t, h, http.MethodGet, "/auth/me", "", withCookie(c)))
+	if me.StoredBytes != 2100 || me.ReservedBytes != 300 || me.UsedBytes != 2400 {
+		t.Errorf("me before the check is due = %+v, want stored 2100, reserved 300, used 2400", me)
+	}
+
+	// Once the check is due, /auth/me alone drops the file B2 no longer has.
+	s.syncedAt.Delete(id)
+	me = decode[meResponse](t, do(t, h, http.MethodGet, "/auth/me", "", withCookie(c)))
+	if me.StoredBytes != 100 || me.ReservedBytes != 300 || me.UsedBytes != 400 {
+		t.Errorf("me after the check = %+v, want stored 100, reserved 300, used 400", me)
+	}
+
+	// Confirm and release answer the same split.
+	u := decode[usageResponse](t, post(t, h, c, "/files/release", mustUpload(t, h, c, "x.txt", 50, "").Key))
+	if u.StoredBytes != 100 || u.ReservedBytes != 300 || u.UsedBytes != 400 {
+		t.Errorf("release answered %+v, want stored 100, reserved 300, used 400", u)
+	}
+}

@@ -146,12 +146,14 @@ func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 type meResponse struct {
-	Username     string `json:"username"`
-	Email        string `json:"email"`        // verified, "" if none
-	PendingEmail string `json:"pendingEmail"` // waiting for its code
-	Verified     bool   `json:"verified"`     // files need this
-	UsedBytes    int64  `json:"usedBytes"`
-	QuotaBytes   int64  `json:"quotaBytes"`
+	Username      string `json:"username"`
+	Email         string `json:"email"`         // verified, "" if none
+	PendingEmail  string `json:"pendingEmail"`  // waiting for its code
+	Verified      bool   `json:"verified"`      // files need this
+	UsedBytes     int64  `json:"usedBytes"`     // stored + reserved, what the quota counts
+	StoredBytes   int64  `json:"storedBytes"`   // confirmed in the bucket
+	ReservedBytes int64  `json:"reservedBytes"` // upload links not yet confirmed
+	QuotaBytes    int64  `json:"quotaBytes"`
 }
 
 func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -161,7 +163,13 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userFrom(r)
-	used, err := s.usedBytes(r.Context(), s.db, u.id)
+	// The meter should match the bucket: check the ledger against it first
+	// (at most every syncEvery), so a file removed outside the app or an
+	// upload that never arrived doesn't keep counting.
+	if s.meSync && u.email != "" {
+		s.syncIfStale(r.Context(), u.id)
+	}
+	stored, reserved, err := s.storageUsage(r.Context(), u.id)
 	if err != nil {
 		log.Printf("usage for user %d: %v", u.id, err)
 		writeError(w, http.StatusInternalServerError, "could not read storage usage")
@@ -169,7 +177,7 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, meResponse{
 		Username: u.username, Email: u.email, PendingEmail: u.pendingEmail, Verified: u.email != "",
-		UsedBytes: used, QuotaBytes: s.cfg.quotaBytes,
+		UsedBytes: stored + reserved, StoredBytes: stored, ReservedBytes: reserved, QuotaBytes: s.cfg.quotaBytes,
 	})
 }
 
