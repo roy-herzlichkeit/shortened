@@ -2,12 +2,14 @@
 # Tears down SHORTENED. on AWS (us-east-1). Run it yourself in Git Bash with
 # your own admin profile, and only after the video and the grading.
 #
-#   bash deploy/teardown.sh                  # delete the 3 stacks, keep the final snapshot
+#   bash deploy/teardown.sh                  # delete the 4 stacks, keep the final snapshot
 #   bash deploy/teardown.sh delete-snapshot  # later: delete that final snapshot
 #
-# Order: shortened-monitoring, shortened-backup, shortened. The main stack's
-# data volume has DeletionPolicy Snapshot, so a final snapshot of /data
-# (accounts, sessions, quota ledger) stays until you delete it on purpose.
+# Order: shortened-staging, shortened-monitoring, shortened-backup, shortened.
+# The main stack's data volume has DeletionPolicy Snapshot, so a final snapshot
+# of /data (accounts, sessions, quota ledger) stays until you delete it on
+# purpose. Staging's data volume leaves a snapshot too; it holds test accounts
+# only, and manual step 7 deletes it.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"
 export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
@@ -28,12 +30,16 @@ manual_steps() {
        --query 'RecoveryPoints[].[RecoveryPointArn,CreationDate]' --output table
      aws backup delete-recovery-point --backup-vault-name shortened-vault --recovery-point-arn <arn>   # each one
      aws backup delete-backup-vault --backup-vault-name shortened-vault
-2. SSM parameters /shortened/* (the B2 settings):
+2. SSM parameters /shortened/* and /shortened-staging/* (the B2 settings):
+     aws ssm delete-parameters --names /shortened-staging/B2_KEY_ID /shortened-staging/B2_APP_KEY \\
+       /shortened-staging/B2_ENDPOINT /shortened-staging/B2_REGION /shortened-staging/B2_BUCKET
      aws ssm delete-parameters --names /shortened/B2_KEY_ID /shortened/B2_APP_KEY \\
        /shortened/B2_ENDPOINT /shortened/B2_REGION /shortened/B2_BUCKET /shortened/QUOTA_MB /shortened/MAX_USERS
 3. B2: remove https://shortened.herzlichkeit-zero.click from the CORS rule of
    shortened-prod (and of shortened, where it was added too). If the live site
    is gone for good, also delete the shortened-prod bucket and its app key.
+   Staging: delete the shortened-staging bucket (test files only) and its key
+   shortened-staging-app.
 4. Claude's access: run .agent/aws/cleanup-claude-access.sh (CloudShell, as you).
    Then delete the boundary. It has extra versions, so delete those first:
      aws iam list-policy-versions --policy-arn arn:aws:iam::$account:policy/shortened-boundary
@@ -43,15 +49,19 @@ manual_steps() {
      aws iam delete-user-policy --user-name HERZLICHKEIT=3301 --policy-name shortened-ssm-params
      aws iam detach-user-policy --user-name HERZLICHKEIT=3301 --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
 6. Claude Code: claude mcp remove aws-mcp --scope local
-7. Later: bash deploy/teardown.sh delete-snapshot (only once you are sure).
-Not touched: the hosted zones, the ACM certificate (and its validation CNAME),
+7. Staging's final snapshot (test data only), listed above as "Staging snapshot":
+     aws ec2 delete-snapshot --snapshot-id <id>
+   The staging ACM certificate and its _<token>.staging.shortened validation
+   CNAME are in no stack; delete them in the ACM and Route 53 consoles.
+8. Later: bash deploy/teardown.sh delete-snapshot (only once you are sure).
+Not touched: the hosted zones, the live ACM certificate (and its validation CNAME),
 the apex/www and thakurag records, the Cutie instance and its volume.
 EOF
 }
 
 case "${1:-stacks}" in
 stacks)
-  echo "This deletes the stacks shortened-monitoring, shortened-backup and shortened."
+  echo "This deletes the stacks shortened-staging, shortened-monitoring, shortened-backup and shortened."
   echo "The site goes offline. The data volume leaves a final snapshot."
   read -r -p 'Type "teardown" to go on: ' answer
   [ "$answer" = teardown ] || { echo "stopped, nothing deleted"; exit 1; }
@@ -60,8 +70,10 @@ stacks)
         --query "Stacks[0].Outputs[?OutputKey=='DataVolumeId'].OutputValue" --output text 2>/dev/null || true)
   start=$(date -u +%FT%TZ)
   [ -n "$vol" ] && [ "$vol" != None ] && echo "$vol $start" >"$state"
+  svol=$(aws cloudformation describe-stacks --stack-name shortened-staging \
+        --query "Stacks[0].Outputs[?OutputKey=='DataVolumeId'].OutputValue" --output text 2>/dev/null || true)
 
-  for s in shortened-monitoring shortened-backup shortened; do
+  for s in shortened-staging shortened-monitoring shortened-backup shortened; do
     if ! aws cloudformation describe-stacks --stack-name "$s" >/dev/null 2>&1; then
       echo "skip   $s (not found)"; continue
     fi
@@ -76,6 +88,12 @@ stacks)
     echo "done   $s"
   done
 
+  if [ -n "$svol" ] && [ "$svol" != None ]; then
+    echo
+    echo "Staging snapshot of $svol (test data; manual step 7 deletes it):"
+    aws ec2 describe-snapshots --owner-ids self --filters "Name=volume-id,Values=$svol" \
+      --query "Snapshots[?StartTime>='$start'].[SnapshotId,StartTime,State,VolumeSize]" --output table
+  fi
   if [ -f "$state" ]; then
     read -r vol start <"$state"
     echo
