@@ -1,10 +1,23 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  SHORTENED. on one EC2 t4g.small behind CloudFront, HTTPS end to end. The
-  app runs in Docker, gets its config from SSM /shortened/*, and serves TLS
-  itself with a Let's Encrypt certificate from certbot dns-route53.
+  SHORTENED. on one EC2 instance behind CloudFront, HTTPS end to end. The
+  app runs in Docker, gets its config from SSM /<Env>/*, and serves TLS
+  itself with a Let's Encrypt certificate from certbot dns-route53. Env
+  "shortened" is live; "shortened-staging" is the staging copy.
 
 Parameters:
+  Env:
+    Type: String
+    Default: shortened
+    AllowedPattern: ^shortened(-[a-z]+)?$
+    Description: >-
+      Name prefix for the SSM path (/<Env>/), the IAM role and profile, the
+      security group and the Name tags. Must start with "shortened" (the
+      deployer may only manage shortened-* roles).
+  InstanceType:
+    Type: String
+    Default: t4g.small
+    AllowedValues: [t4g.micro, t4g.small]
   SiteName:
     Type: String
     Default: shortened.herzlichkeit-zero.click
@@ -65,7 +78,7 @@ Rules:
   NotUsEast1e:
     Assertions:
       - Assert: !Not [!Equals [!Ref AvailabilityZone, us-east-1e]]
-        AssertDescription: t4g.small is not offered in us-east-1e.
+        AssertDescription: t4g instances are not offered in us-east-1e.
 
 Conditions:
   UsePinnedImage: !Not [!Equals [!Ref PinnedImageId, ""]]
@@ -77,7 +90,7 @@ Resources:
   OriginSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupName: shortened-origin
+      GroupName: !Sub ${Env}-origin
       GroupDescription: HTTPS from CloudFront only. No SSH; use SSM Session Manager.
       VpcId: !Ref VpcId
       SecurityGroupIngress:
@@ -92,7 +105,7 @@ Resources:
           IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
       Tags:
-        - { Key: Name, Value: shortened-origin }
+        - { Key: Name, Value: !Sub "${Env}-origin" }
         - { Key: Project, Value: shortened }
 
   ElasticIP:
@@ -100,7 +113,7 @@ Resources:
     Properties:
       Domain: vpc
       Tags:
-        - { Key: Name, Value: shortened }
+        - { Key: Name, Value: !Ref Env }
         - { Key: Project, Value: shortened }
 
   ElasticIPAssociation:
@@ -114,7 +127,7 @@ Resources:
   InstanceRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: shortened-instance-role
+      RoleName: !Sub ${Env}-instance-role
       PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/shortened-boundary
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -135,7 +148,7 @@ Resources:
               - Sid: ReadOwnConfig
                 Effect: Allow
                 Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
-                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/shortened/*
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Env}/*
               - Sid: CertbotLookup
                 Effect: Allow
                 Action: [route53:ListHostedZones, route53:GetChange]
@@ -155,7 +168,7 @@ Resources:
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      InstanceProfileName: shortened-instance-profile
+      InstanceProfileName: !Sub ${Env}-instance-profile
       Roles: [!Ref InstanceRole]
 
   # ---------- Instance and data ----------
@@ -172,7 +185,7 @@ Resources:
       VolumeType: gp3
       Encrypted: true
       Tags:
-        - { Key: Name, Value: shortened-data }
+        - { Key: Name, Value: !Sub "${Env}-data" }
         - { Key: Project, Value: shortened }
 
   DataVolumeAttachment:
@@ -187,7 +200,7 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       ImageId: !If [UsePinnedImage, !Ref PinnedImageId, !Ref ImageId]
-      InstanceType: t4g.small
+      InstanceType: !Ref InstanceType
       # Standard credits: never billed for surplus CPU (Unlimited is the default).
       CreditSpecification: { CPUCredits: standard }
       SubnetId: !Ref SubnetId
@@ -204,7 +217,7 @@ Resources:
             Encrypted: true
             DeleteOnTermination: true
       Tags:
-        - { Key: Name, Value: shortened }
+        - { Key: Name, Value: !Ref Env }
         - { Key: Project, Value: shortened }
       # Bash inside Fn::Sub: ${Name} is a template value, ${!name} a bash one.
       # Nothing here prints a secret, so there is no set -x.
@@ -234,11 +247,11 @@ Resources:
           # 3a. Config from SSM, written fresh at every service start.
           cat >/usr/local/bin/shortened-env <<'EOF'
           #!/bin/bash
-          # Writes /etc/shortened.env from SSM /shortened/*. Never prints values.
+          # Writes /etc/shortened.env from SSM /${Env}/*. Never prints values.
           set -euo pipefail
           umask 077
           tmp=$(mktemp /etc/shortened.env.XXXXXX)
-          aws ssm get-parameters-by-path --region ${AWS::Region} --path /shortened/ \
+          aws ssm get-parameters-by-path --region ${AWS::Region} --path /${Env}/ \
             --with-decryption --query 'Parameters[].[Name,Value]' --output text |
             while IFS=$'\t' read -r name value; do printf '%s=%s\n' "${!name##*/}" "$value"; done >"$tmp"
           mv "$tmp" /etc/shortened.env
@@ -322,7 +335,7 @@ Resources:
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
-        Comment: shortened
+        Comment: !Ref Env
         Enabled: true
         Aliases: [!Ref SiteName]
         HttpVersion: http2and3
@@ -359,7 +372,7 @@ Resources:
           # app's sameOrigin check sees Host equal to Origin.
           OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
       Tags:
-        - { Key: Name, Value: shortened }
+        - { Key: Name, Value: !Ref Env }
         - { Key: Project, Value: shortened }
 
   SiteRecordA:
