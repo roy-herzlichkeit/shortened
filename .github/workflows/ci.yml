@@ -147,7 +147,7 @@ jobs:
           grep -q 'HttpOnly' "$jar" || grep -q '#HttpOnly_' "$jar" || { echo "session cookie is not HttpOnly"; cat "$jar"; exit 1; }
           expect 200 -b "$jar" "$base/auth/me"
           grep -q '"username":"ci-user"' /tmp/body || { echo "wrong user"; cat /tmp/body; exit 1; }
-          expect 409 -H "$json" -d '{"username":"CI-USER","password":"another-password"}' "$base/auth/signup"
+          expect 409 -H "$json" -d '{"username":"CI-USER","password":"another-password","email":"other@example.test"}' "$base/auth/signup"
           expect 401 -H "$json" -d '{"username":"ci-user","password":"wrong-password"}' "$base/auth/login"
           expect 403 -b "$jar" -H "$json" -H 'Origin: https://evil.example' -d '{"filename":"a","size":1}' "$base/upload-url"
 
