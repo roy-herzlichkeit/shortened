@@ -243,6 +243,14 @@ parameters made no change to the live stack.
   hidden prompt).
 - The boundary (v5) lets certbot write `_acme-challenge.staging.shortened…`.
 - No backup plan or alarms: staging holds test data only.
+- **Swap.** The t4g.micro has 910 MB and no swap, and the first Go build was
+  killed by the OOM killer (it took cloud-init with it). After the create,
+  add a 2 GB swap file and re-run the bootstrap, through Session Manager:
+  `fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile`,
+  `echo '/swapfile none swap defaults 0 0' >> /etc/fstab`, then
+  `systemd-run --unit shortened-rebootstrap bash /var/lib/cloud/instance/scripts/part-001`.
+  (It is not in the template, because changing UserData would modify the live
+  instance too.)
 - Cost: about $6/month for the t4g.micro plus $3.65 for its IPv4 (the free
   trial covers only one t4g instance). **Stop the instance when you are not
   testing.**
