@@ -207,6 +207,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/auth/email", noStore(s.rateLimited(s.requireUser(s.handleSetEmail))))
 	mux.Handle("/auth/email/verify", noStore(s.rateLimited(s.requireUser(s.handleVerifyEmail))))
 	mux.Handle("/auth/password", noStore(s.rateLimited(s.requireUser(s.handleChangePassword))))
+	mux.Handle("/auth/account/delete", noStore(s.rateLimited(s.requireUser(s.handleDeleteAccount))))
 
 	// Files need a verified address.
 	mux.Handle("/upload-url", noStore(s.requireVerified(s.handleUploadURL)))

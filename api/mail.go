@@ -161,6 +161,15 @@ func resetMessage(to, username, code string) message {
 // inUseMessage goes to an address that already belongs to a verified account
 // when someone enters it again, instead of a code. The answer on the page is
 // the same either way, so the page never reveals that the address is taken.
+// deletedMessage confirms that an account and its files are gone.
+func deletedMessage(to, username string) message {
+	return buildMessage(to, "Your SHORTENED. account is deleted",
+		[]string{
+			"The account " + username + " and every file in it have been deleted, as you asked.",
+			"Nothing of it is kept. If this wasn't you, someone knew your password: use a new one wherever you used it.",
+		}, "", mailFooter)
+}
+
 func inUseMessage(to string) message {
 	return buildMessage(to, "Your address is already on SHORTENED.",
 		[]string{
