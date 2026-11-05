@@ -12,8 +12,11 @@ import (
 
 // Plans. Every account is on one of two, for life:
 //
-//   - free: the QUOTA_MB quota (500 MB) and share links up to 7 days;
-//   - corpo: 5 GB and links up to 30 days, a CORPO badge and a red theme.
+//   - free: the QUOTA_MB quota (500 MB), files up to 50 MB each and share
+//     links up to 7 days;
+//   - corpo: 5 GB, files of any size within it (up to the 5,000,000,000
+//     bytes B2 takes in one upload), links up to 30 days, a CORPO badge and
+//     a red theme.
 //     The coupon gives it; buying it (₹1) comes in Prompt 15.
 //
 // The plan is read with the session on every request, so a change applies at
@@ -26,6 +29,7 @@ const (
 
 	corpoQuota    = 5 << 30 // 5 GB
 	corpoShareTTL = 30 * 24 * time.Hour
+	corpoMaxFile  = 5_000_000_000 // the most B2 accepts in a single PUT
 )
 
 func paidPlan(plan string) bool { return plan == planCorpo }
@@ -36,6 +40,14 @@ func (s *server) quotaFor(u user) int64 {
 		return corpoQuota
 	}
 	return s.cfg.quotaBytes
+}
+
+// maxFileFor is the largest single file the account may upload.
+func (s *server) maxFileFor(u user) int64 {
+	if paidPlan(u.plan) {
+		return corpoMaxFile
+	}
+	return maxUploadSize
 }
 
 // maxShareTTL is the longest share link the account may make.

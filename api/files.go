@@ -24,8 +24,17 @@ import (
 
 // ledgerGrace is how long a signed-but-unseen upload keeps its quota
 // reservation: the link's lifetime plus time for a slow upload that started
-// just before the link expired.
-const ledgerGrace = linkTTL + 15*time.Minute
+// just before the link expired. uploadGrace adds time for the file's size at
+// a slow connection's pace (slowUploadRate), so a large CORPO upload still in
+// progress isn't dropped.
+const (
+	ledgerGrace    = linkTTL + 15*time.Minute
+	slowUploadRate = 256 << 10 // bytes a second: about 2 Mbit/s
+)
+
+func uploadGrace(size int64) time.Duration {
+	return ledgerGrace + time.Duration(size/slowUploadRate)*time.Second
+}
 
 // syncEvery is how stale the ledger may be when /auth/me reports usage.
 const syncEvery = 30 * time.Second
@@ -76,8 +85,12 @@ func (s *server) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "size must not be negative")
 		return
 	}
-	if req.Size > maxUploadSize {
-		writeError(w, http.StatusRequestEntityTooLarge, "file is larger than the 50 MB limit")
+	if limit := s.maxFileFor(u); req.Size > limit {
+		msg := "file is larger than the 50 MB limit"
+		if paidPlan(u.plan) {
+			msg = "file is larger than " + humanSize(limit) + ", the most a single upload can be"
+		}
+		writeError(w, http.StatusRequestEntityTooLarge, msg)
 		return
 	}
 	switch req.OnConflict {
@@ -400,19 +413,19 @@ func (s *server) syncFiles(ctx context.Context, userID int64) ([]bucketObject, e
 // returns the rows to drop (see syncFiles), and the "Replace" uploads whose new
 // object is present, as new key -> key being replaced.
 func ledgerChanges(ctx context.Context, tx *sql.Tx, userID int64, present map[string]bool, listStart int64) ([]string, map[string]string, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT key, created_at, confirmed_at, replaces FROM files WHERE user_id = ?`, userID)
+	rows, err := tx.QueryContext(ctx, `SELECT key, size, created_at, confirmed_at, replaces FROM files WHERE user_id = ?`, userID)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer func() { _ = rows.Close() }() // read-only; rows.Err below reports failures
 
-	lapsed := time.Now().Add(-ledgerGrace).Unix()
+	now := time.Now()
 	var stale []string
 	replaced := map[string]string{}
 	for rows.Next() {
 		var key, replaces string
-		var createdAt, confirmedAt int64
-		if err := rows.Scan(&key, &createdAt, &confirmedAt, &replaces); err != nil {
+		var size, createdAt, confirmedAt int64
+		if err := rows.Scan(&key, &size, &createdAt, &confirmedAt, &replaces); err != nil {
 			return nil, nil, err
 		}
 		switch {
@@ -422,7 +435,7 @@ func ledgerChanges(ctx context.Context, tx *sql.Tx, userID int64, present map[st
 			}
 		case confirmedAt > 0 && confirmedAt < listStart:
 			stale = append(stale, key) // was stored, isn't any more
-		case confirmedAt == 0 && createdAt < lapsed:
+		case confirmedAt == 0 && createdAt < now.Add(-uploadGrace(size)).Unix():
 			stale = append(stale, key) // the upload never arrived
 		}
 	}

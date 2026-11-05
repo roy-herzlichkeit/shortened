@@ -244,3 +244,61 @@ func TestMigratePlans(t *testing.T) {
 		db.Close()
 	}
 }
+
+// Files: 50 MB at most on free; on corpo any size within the plan, up to
+// what B2 takes in one upload.
+func TestPlanFileSize(t *testing.T) {
+	_, endpoint := newFakeB2(t)
+	s, h := newTestServer(t, promoConfig(endpoint))
+	c := signup(t, h, "alice")
+	if m := me(t, h, c); m.MaxFileBytes != maxUploadSize {
+		t.Errorf("free maxFileBytes %d, want %d", m.MaxFileBytes, maxUploadSize)
+	}
+	if rec := requestUpload(t, h, c, "big.bin", maxUploadSize+1, ""); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("free, 50 MB and a byte: status %d, want 413", rec.Code)
+	}
+	if _, err := s.db.Exec(`UPDATE users SET plan = 'corpo' WHERE username = 'alice'`); err != nil {
+		t.Fatal(err)
+	}
+	if m := me(t, h, c); m.MaxFileBytes != corpoMaxFile {
+		t.Errorf("corpo maxFileBytes %d, want %d", m.MaxFileBytes, corpoMaxFile)
+	}
+	if up := mustUpload(t, h, c, "game.zip", 3<<30, ""); up.Name != "game.zip" {
+		t.Errorf("corpo, 3 GB: stored as %q", up.Name)
+	}
+	rec := requestUpload(t, h, c, "huge.bin", corpoMaxFile+1, "")
+	if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), "single upload") {
+		t.Errorf("corpo, over the single-upload limit: status %d, body %s", rec.Code, rec.Body)
+	}
+}
+
+// A reservation is kept longer the larger its file, so a big upload on a slow
+// connection isn't dropped while it is still being sent.
+func TestUploadGraceGrowsWithSize(t *testing.T) {
+	s, h := newTestServer(t, testConfig(testEndpoint))
+	signup(t, h, "alice")
+	old := time.Now().Add(-ledgerGrace - time.Minute).Unix()
+	for _, row := range []struct {
+		key  string
+		size int64
+	}{{"u/1/0123456789abcdef-small.txt", 1 << 10}, {"u/1/0123456789abcdee-big.zip", 3 << 30}} {
+		if _, err := s.db.Exec(`INSERT INTO files (key, user_id, size, created_at, confirmed_at) VALUES (?, 1, ?, ?, 0)`, row.key, row.size, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stale, _, err := ledgerChanges(t.Context(), tx, 1, map[string]bool{}, time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0] != "u/1/0123456789abcdef-small.txt" {
+		t.Errorf("stale %v; want only the small lapsed upload", stale)
+	}
+	if got := uploadGrace(3 << 30); got < 3*time.Hour {
+		t.Errorf("grace for 3 GB is %v; want over 3 h at the slow rate", got)
+	}
+}

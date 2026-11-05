@@ -56,8 +56,8 @@ func (s *server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 
 	var inFlight int
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM files WHERE user_id = ? AND confirmed_at = 0 AND created_at > ?`,
-		u.id, time.Now().Add(-ledgerGrace).Unix()).Scan(&inFlight); err != nil {
+		`SELECT COUNT(*) FROM files WHERE user_id = ? AND confirmed_at = 0 AND created_at + size / ? > ?`,
+		u.id, slowUploadRate, time.Now().Add(-ledgerGrace).Unix()).Scan(&inFlight); err != nil {
 		log.Printf("delete account %d: %v", u.id, err)
 		writeError(w, http.StatusInternalServerError, "could not delete the account")
 		return

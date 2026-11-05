@@ -139,7 +139,7 @@
           <button id="upload" class="btn btn-primary" type="button">Upload</button>
         </div>
 
-        <p class="hint">Pick one file or several at once, up to 50 MB each. Names keep letters, digits, dot, underscore and dash; spaces become dashes and other characters are dropped.</p>
+        <p class="hint">Pick one file or several at once, <span id="max-file-hint">up to 50 MB each</span>. Names keep letters, digits, dot, underscore and dash; spaces become dashes and other characters are dropped.</p>
 
         <div id="progress" class="progress-row" hidden>
           <div class="bar bar-progress"><div id="progress-bar" class="bar-fill"></div></div>
@@ -283,8 +283,8 @@
 </dialog>
 
 <footer class="footer mono">
-  <span>// Max 50 MB per file</span>
-  <span>// Share links self-destruct (10 min to 7 days)</span>
+  <span id="footer-size">// Max 50 MB per file</span>
+  <span id="footer-links">// Share links self-destruct (10 min to 7 days)</span>
 </footer>
 
 <script src="app.js"></script>

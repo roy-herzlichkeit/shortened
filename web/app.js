@@ -3,7 +3,8 @@
 // The page is served by the API itself, so every call is same-origin and the
 // HttpOnly session cookie rides along automatically.
 
-const MAX_BYTES = 50 * 1024 * 1024;
+const MAX_BYTES = 50 * 1024 * 1024; // free; /auth/me says the account's own (maxFileBytes)
+let maxFile = MAX_BYTES;
 const MAX_NAME = 120;
 
 const $ = (id) => document.getElementById(id);
@@ -200,7 +201,13 @@ function checkFilename(raw) {
 // Only one of the four views is shown at a time.
 function showView(view) {
   for (const v of [authView, forgotView, verifyView, appView]) v.hidden = v !== view;
-  if (view !== appView) document.body.classList.remove("theme-corpo"); // signed out: the free look
+  if (view !== appView) { // signed out: the free look and limits
+    document.body.classList.remove("theme-corpo");
+    maxFile = MAX_BYTES;
+    $("max-file-hint").textContent = "up to 50 MB each";
+    $("footer-size").textContent = "// Max 50 MB per file";
+    $("footer-links").textContent = "// Share links self-destruct (10 min to 7 days)";
+  }
 }
 
 function showAuth() {
@@ -291,6 +298,10 @@ function renderPlan(me) {
   document.body.classList.toggle("theme-corpo", corpo);
   const days = Math.round((me.shareMaxSeconds || 7 * 86400) / 86400);
   const name = corpo ? "CORPO, for life" : "Free";
+  maxFile = me.maxFileBytes || MAX_BYTES;
+  $("max-file-hint").textContent = corpo ? "of any size within your " + formatSize(me.quotaBytes) : "up to 50 MB each";
+  $("footer-size").textContent = corpo ? "// Any file size within " + formatSize(me.quotaBytes) : "// Max 50 MB per file";
+  $("footer-links").textContent = "// Share links self-destruct (10 min to " + days + " days)";
   accountPlan.textContent = name + " · " + formatSize(me.quotaBytes) + " of storage, share links up to " + days + " days";
   getPremium.hidden = plan !== "free";
   couponForm.hidden = !!me.couponUsed;
@@ -908,7 +919,10 @@ function checkBatch(files) {
   for (const file of files) {
     const checked = checkFilename(file.name);
     if (checked.error) problems.push(file.name + ": " + checked.error);
-    else if (file.size > MAX_BYTES) problems.push(file.name + " is larger than 50 MB.");
+    else if (file.size > maxFile) {
+      problems.push(file.name + " is larger than " + formatSize(maxFile) +
+        (maxFile > MAX_BYTES ? ", the most a single upload can be." : "."));
+    }
     else if (names.has(checked.name)) problems.push(checked.name + " is chosen twice.");
     else {
       names.add(checked.name);

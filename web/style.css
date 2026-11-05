@@ -50,7 +50,14 @@ body.theme-corpo {
   --cyan: #ffffff;
   --cyan-rgb: 255, 255, 255;
   --corpo-danger: #fcee0a;
+  --bg: #000000;
+  /* Pitch black: the grid stays, the coloured glow at the top goes. */
+  background:
+    linear-gradient(rgba(var(--cyan-rgb), .035) 1px, transparent 1px) 0 0 / 100% 32px,
+    linear-gradient(90deg, rgba(var(--cyan-rgb), .035) 1px, transparent 1px) 0 0 / 32px 100%,
+    #000000;
 }
+html:has(body.theme-corpo) { background: #000000; }
 body.theme-corpo .btn-danger { color: var(--corpo-danger); --btn-line: var(--corpo-danger); --btn-glow: var(--corpo-danger); }
 body.theme-corpo .btn-danger:hover:not(:disabled) { color: #000; --btn-fill: var(--corpo-danger); }
 /* Main buttons hover like Sign out: black fill, red label and outline. */
