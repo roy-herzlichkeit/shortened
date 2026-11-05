@@ -18,6 +18,7 @@
   <div id="account" class="account" hidden>
     <span class="account-label">User</span>
     <button id="whoami" class="account-name" type="button" aria-haspopup="dialog" title="Account settings"></button>
+    <span id="plan-badge" class="plan-badge" hidden></span>
     <button id="logout" class="btn btn-ghost btn-small" type="button">Sign out</button>
   </div>
 </header>
@@ -50,6 +51,8 @@
         <div id="email-row" class="form" hidden>
           <label for="email">Email</label>
           <input id="email" name="email" type="email" autocomplete="email" spellcheck="false" maxlength="254">
+          <label for="coupon">Coupon (optional)</label>
+          <input id="coupon" name="coupon" type="text" autocomplete="off" spellcheck="false" maxlength="64">
         </div>
 
         <label for="password">Password</label>
@@ -136,7 +139,7 @@
           <button id="upload" class="btn btn-primary" type="button">Upload</button>
         </div>
 
-        <p class="hint">Pick one file or several at once, up to 50 MB each. Names may use letters, digits, dot, underscore and dash. Spaces become dashes.</p>
+        <p class="hint">Pick one file or several at once, up to 50 MB each. Names keep letters, digits, dot, underscore and dash; spaces become dashes and other characters are dropped.</p>
 
         <div id="progress" class="progress-row" hidden>
           <div class="bar bar-progress"><div id="progress-bar" class="bar-fill"></div></div>
@@ -174,6 +177,16 @@
     </div>
     <p class="hint">Email: <span id="account-email" class="mono"></span></p>
 
+    <div class="plan-section">
+      <p class="hint">Plan: <span id="account-plan" class="mono"></span></p>
+      <button id="get-premium" class="btn btn-primary" type="button">Get CORPO (₹1)</button>
+      <form id="coupon-form" class="form" novalidate>
+        <label for="coupon-code">Coupon code</label>
+        <input id="coupon-code" name="code" type="text" autocomplete="off" spellcheck="false" required maxlength="64">
+        <button class="btn btn-ghost" type="submit">Apply coupon</button>
+      </form>
+    </div>
+
     <form id="email-change-form" class="form" novalidate>
       <label for="new-email">New email</label>
       <input id="new-email" name="email" type="email" autocomplete="email" spellcheck="false" required maxlength="254">
@@ -203,7 +216,7 @@
 
     <form id="delete-form" class="form" novalidate>
       <h3 class="danger-title">Delete account</h3>
-      <p class="hint">This deletes the account and every file in it, at once and for good. Premium, if you have it,
+      <p class="hint">This deletes the account and every file in it, at once and for good. CORPO, if you have it,
         is lost with no refund. The username becomes free for anyone to take.</p>
       <label for="delete-password">Password</label>
       <input id="delete-password" name="password" type="password" autocomplete="current-password"

@@ -350,9 +350,12 @@ func TestUploadNameRules(t *testing.T) {
 	if up := mustUpload(t, h, c, "my holiday photo.jpg", 1, ""); up.Name != "my-holiday-photo.jpg" {
 		t.Errorf("spaces: stored %q", up.Name)
 	}
-	rec := requestUpload(t, h, c, "photo (1).jpg", 1, "")
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "'('") {
-		t.Errorf("bad characters: status %d, body %s", rec.Code, rec.Body)
+	if up := mustUpload(t, h, c, "photo (1)!.jpg", 1, ""); up.Name != "photo-1.jpg" {
+		t.Errorf("bad characters: stored %q, want them dropped", up.Name)
+	}
+	rec := requestUpload(t, h, c, "(!)", 1, "")
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "letter or digit") {
+		t.Errorf("nothing left after cleaning: status %d, body %s", rec.Code, rec.Body)
 	}
 	if rec := requestUpload(t, h, c, "a.txt", 1, "overwrite"); rec.Code != http.StatusBadRequest {
 		t.Errorf("unknown onConflict: status %d, want 400", rec.Code)

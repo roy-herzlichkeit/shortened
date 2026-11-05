@@ -44,10 +44,6 @@ const base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 var shareCodePattern = regexp.MustCompile(`^[0-9A-Za-z]{24}$`)
 
-// maxShareTTL is the longest link the account may make. Plans come with
-// Prompt 14; until then every account is on the free plan.
-func (s *server) maxShareTTL(_ user) time.Duration { return freeShareTTL }
-
 // newShareCode draws shareCodeLen base62 characters from crypto/rand. Bytes of
 // 248 and above are dropped, so each character is uniform (248 = 4 * 62).
 func newShareCode() (string, error) {

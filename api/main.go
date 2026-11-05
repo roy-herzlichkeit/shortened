@@ -58,6 +58,7 @@ type config struct {
 	mailFrom     string // sender address; SES is used when set
 	mailLog      bool   // no SES: write mails (codes included) to the log
 	sesRegion    string
+	promoCode    string // the CORPO coupon; "" turns the coupon off. Never logged.
 }
 
 func loadConfig() (config, error) {
@@ -76,6 +77,7 @@ func loadConfig() (config, error) {
 		mailFrom:     os.Getenv("MAIL_FROM"),
 		mailLog:      os.Getenv("MAIL_LOG") == "true",
 		sesRegion:    envOr("SES_REGION", "us-east-1"),
+		promoCode:    os.Getenv("PROMO_CODE"),
 	}
 
 	// Sign-up and password reset need mail. Refusing to start beats an app
@@ -212,6 +214,7 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/auth/email/verify", noStore(s.rateLimited(s.requireUser(s.handleVerifyEmail))))
 	mux.Handle("/auth/password", noStore(s.rateLimited(s.requireUser(s.handleChangePassword))))
 	mux.Handle("/auth/account/delete", noStore(s.rateLimited(s.requireUser(s.handleDeleteAccount))))
+	mux.Handle("/auth/coupon", noStore(s.rateLimited(s.requireVerified(s.handleCoupon))))
 
 	// Files need a verified address.
 	mux.Handle("/upload-url", noStore(s.requireVerified(s.handleUploadURL)))
@@ -302,6 +305,8 @@ func main() {
 		log.Fatalf("aws config: %v", err)
 	}
 
+	go s.logDailyCounts(ctx)
+
 	srv := newHTTPServer(cfg, s.routes())
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
@@ -318,8 +323,12 @@ func main() {
 		if cfg.mailFrom == "" {
 			mail = "log only (MAIL_LOG)"
 		}
-		log.Printf("listening on :%s, %s (bucket %q, database %q, quota %d MB, mail %s)",
-			cfg.port, scheme, cfg.bucket, cfg.dbPath, cfg.quotaBytes>>20, mail)
+		coupon := "off"
+		if cfg.promoCode != "" {
+			coupon = "on"
+		}
+		log.Printf("listening on :%s, %s (bucket %q, database %q, quota %d MB, mail %s, coupon %s)",
+			cfg.port, scheme, cfg.bucket, cfg.dbPath, cfg.quotaBytes>>20, mail, coupon)
 		serveErr <- serve(srv, ln, cfg)
 	}()
 

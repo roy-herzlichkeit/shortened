@@ -28,18 +28,19 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | --- | --- | --- |
 | `GET /`, `/app.js`, `/style.css` | none | The page, with a strict CSP. |
 | `GET /health` | none | `{"status":"ok"}` once the database answers. |
-| `POST /auth/signup` | none, rate-limited | `{"username","password","email"}` → `202 {"username","pendingEmail"}`. Stores a pending sign-up (no account yet), mails its code and sets the `signup` cookie (HttpOnly, path `/auth/signup`, 1 hour). Name taken → `409`; over 3 mails an hour to the address → `429`; mail refused → `502` and nothing is kept. |
+| `POST /auth/signup` | none, rate-limited | `{"username","password","email","coupon"}` (coupon optional) → `202 {"username","pendingEmail"}`. Stores a pending sign-up (no account yet), mails its code and sets the `signup` cookie (HttpOnly, path `/auth/signup`, 1 hour). Name taken → `409`; a wrong coupon → `400` before any mail; over 3 mails an hour to the address → `429`; mail refused → `502` and nothing is kept. |
 | `POST /auth/signup/verify` | `signup` cookie, rate-limited | `{"code"}` → `201 {"username"}`: creates the account with its address verified and sets the session cookie. Wrong or expired code → `400`; name or address taken meanwhile → `409`; no pending sign-up → `410`. |
 | `POST /auth/signup/resend` | `signup` cookie, rate-limited | Mails a new code → `202 {"pendingEmail"}`. Same `429`, `502` and `410` as above. |
 | `GET /auth/signup/pending` | `signup` cookie | `200 {"username","pendingEmail"}` or `404`; lets the page pick a sign-up back up after a reload. |
 | `POST /auth/login` | none, rate-limited | `{"username","password"}`, where `username` may also be the verified email → `200`, sets the session cookie. |
 | `POST /auth/logout` | cookie | Ends this session → `204`. |
-| `GET /auth/me` | cookie | `{"username","email","pendingEmail","verified","usedBytes","storedBytes","reservedBytes","quotaBytes"}`. First checks the ledger against the bucket (at most every 30 s per user), so `storedBytes` is what B2 holds; `reservedBytes` is held by upload links not yet confirmed; `usedBytes` is their sum, which the quota counts. |
+| `GET /auth/me` | cookie | `{"username","email","pendingEmail","verified","usedBytes","storedBytes","reservedBytes","quotaBytes","plan","couponUsed","shareMaxSeconds"}`. `plan` is `free` or `corpo`; `quotaBytes` and `shareMaxSeconds` follow it. First checks the ledger against the bucket (at most every 30 s per user), so `storedBytes` is what B2 holds; `reservedBytes` is held by upload links not yet confirmed; `usedBytes` is their sum, which the quota counts. |
 | `POST /auth/email` | cookie, rate-limited | `{"email","password"}` → `202 {"pendingEmail"}`: mails a code to the address (first address, a new code, or a change; a change needs the password, else `403`). Over 3 mails an hour → `429`. |
 | `POST /auth/email/verify` | cookie, rate-limited | `{"code"}` → `200 {"email"}`: the pending address becomes the account's. Wrong or expired → `400`. |
 | `POST /auth/forgot` | none, rate-limited | `{"login"}` (username or email) → always `202` with the same message; a code goes to the verified address if there is one. |
 | `POST /auth/reset` | none, rate-limited | `{"login","code","password"}` → `200`, sets the password, ends every session, starts a new one. Any failure → `400` "that code is wrong or has expired". |
 | `POST /auth/password` | cookie, rate-limited | `{"current","password"}` → `204`, ends every other session. Wrong current password → `403`. |
+| `POST /auth/coupon` | cookie, verified, rate-limited | `{"code"}` → `200 {"plan","quotaBytes","shareMaxSeconds"}`: the account becomes CORPO for life. Case and surrounding spaces don't matter. Wrong → `400`, already used → `409`, no coupon configured → `404`. |
 | `POST /auth/account/delete` | cookie, rate-limited | `{"password","confirm"}` with `confirm` = `DELETE` → `204`, the cookie cleared. Deletes every B2 version under `u/<id>/`, then every row of the account. Wrong word → `400`, wrong password → `403`, an upload in flight → `409`, B2 failing → `502` with nothing else changed (asking again finishes). |
 | `POST /upload-url` | cookie | `{"filename","size","onConflict"}` → `{"key","url","name"}`, a presigned PUT. `onConflict` is `""` (ask), `"replace"` or `"keepboth"`. A name in use with `""` gets `409 {"error","conflict":true,"name","suggestion"}`; a name with an upload still in flight gets `409 {"error"}`; a refused name gets `400`; no room gets `413`. |
 | `POST /files/confirm?key=` | cookie | After a successful PUT. HEADs the object, records its real size, finishes a Replace → `{"usedBytes","quotaBytes"}`. No object → `404`, and the reservation is dropped. |
@@ -151,10 +152,13 @@ Databases from before this gain `confirmed_at` and `replaces` on open
 (`migrateFilesColumns`, logged as `migration: files table gained ...`). Old
 rows start unconfirmed and are confirmed by the first listing that sees them.
 
-**File names.** New uploads may use only `A-Z a-z 0-9 . _ -`, up to 120
-bytes, with at least one letter or digit. Spaces become `-`; anything else is
-refused with a message naming the characters, by the page before asking and
-by the server with `400` (`checkFilename`). Names stored under the old rule
+**File names.** New uploads keep only `A-Z a-z 0-9 . _ -`, up to 120
+bytes, with at least one letter or digit. Spaces become `-` and any other
+character is dropped (`my file!.txt` → `my-file.txt`): the page does it before
+asking and says "Renamed … (dropped characters that aren't allowed)" with the
+upload's result; the server applies the same rule (`checkFilename`,
+`cleanName`) and refuses with `400` only a name with no letter or digit left
+or one too long. Names stored under the old rule
 stay as they are; they already fit the key pattern.
 
 **Same name.** A name is in use if one of the user's stored files has it. The
@@ -294,7 +298,7 @@ no account, until the link expires or its owner revokes it. `api/shares.go`.
   the sign-in limiter.
 - The owner picks the lifetime from presets (10 minutes, 1 hour, 1 day, 7
   days) or a custom value, from 10 minutes up to the plan's maximum
-  (`maxShareTTL`: 7 days for everyone until plans arrive in Prompt 14).
+  (`maxShareTTL`: 7 days on free, 30 on CORPO; see Plans).
 - The page shows only the name, the size and the expiry. Download goes to
   `/s/<code>/download`, which signs a new 10-minute attachment link at each
   click, so a B2 URL copied out of the browser dies quickly while the share
@@ -312,6 +316,32 @@ no account, until the link expires or its owner revokes it. `api/shares.go`.
 - Never cached (`no-store`, and CloudFront has caching off), never indexed
   (`X-Robots-Tag` and the robots meta tag), and `Referrer-Policy: no-referrer`
   keeps the code out of other sites' logs.
+
+## Plans
+
+`api/plans.go`. Every account is on one of two, for life (`users.plan`):
+
+| | free | CORPO |
+|---|---|---|
+| Storage | `QUOTA_MB` (500 MB) | 5 GB |
+| Share links up to | 7 days | 30 days |
+| Look | yellow theme | `CORPO` badge by the name; yellow and red swap (`body.theme-corpo`) |
+
+- The coupon gives CORPO, at sign-up (field "Coupon (optional)") or later in
+  Account. The code is `PROMO_CODE` (SSM `/<Env>/PROMO_CODE`), never in the
+  repo; without it the coupon is off. Both sides are lower-cased, trimmed and
+  hashed, then compared in constant time. Once per account (`coupon_at`), and
+  the `UPDATE … WHERE coupon_at = 0` makes a parallel second try a no-op. It
+  goes through the sign-in rate limiter.
+- "Get CORPO (₹1)" only says it is coming soon; buying arrives in Prompt 15.
+- The plan is read with the session on every request, so a change applies at
+  once: the meter, the upload quota and the share maximum all follow.
+- No admin page: the log has `daily: <n> users, <n> corpo` at start and
+  every 24 h, and `account <id> redeemed the coupon` when it is used.
+- Databases from before gain `users.plan` (default `free`), `users.coupon_at`
+  and `signups.coupon` on open (`migratePlans`), logged as
+  `migration: users table gained plan, coupon_at` and
+  `migration: signups table gained coupon`.
 
 ## Known limits
 
@@ -332,6 +362,8 @@ Optional, with defaults:
 - `DB_PATH` = `shortened.db`
 - `QUOTA_MB` = `500`
 - `MAX_USERS` = `0`, meaning no limit
+- `PROMO_CODE` = empty, meaning the coupon is off. From SSM
+  `/<Env>/PROMO_CODE` on the servers; never logged or committed.
 - `COOKIE_SECURE` = `true`
 - `TRUST_PROXY` = `false`
 - `TLS_CERT_FILE`, `TLS_KEY_FILE` = empty, meaning plain HTTP. Set both to
@@ -582,3 +614,19 @@ Not run:
   uploaded before it: e.txt."). The dev bucket's CORS doesn't list the local
   origin, so the walk answered the preflight itself and replayed each PUT from
   Node to the same signed URL.
+
+**Plans (CORPO) and name cleaning**, on 2026-11-05:
+
+- `go test ./api`: the coupon (wrong codes, other letter cases, once only,
+  quota at once, at sign-up, off without `PROMO_CODE`, rate limited), the
+  share maximum per plan, the counts, the migration, and name cleaning
+  (`my file!.txt` → `my-file.txt`, nothing left → `400`).
+- Headless Chrome, local server with a fake coupon, two fresh accounts above
+  id 2 (both deleted at the end): free has no badge, "0 B of 500 MB" and the
+  yellow top bar; "Get CORPO (₹1)" says coming soon; a wrong coupon is
+  refused; the right one in other letter cases gives the CORPO badge, "0 B of
+  5 GB", 30-day links and the red top bar at once; signing out brings yellow
+  back; sign-up with a wrong coupon is refused and with the right one starts
+  on CORPO. Choosing `my file!.txt` reports "Renamed “my file!.txt” to
+  “my-file.txt”". 320 px fits; no script errors. The PUT itself failed on
+  the dev bucket's CORS, as before; staging uploads from the browser.

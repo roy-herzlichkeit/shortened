@@ -241,6 +241,14 @@ func TestCheckFilename(t *testing.T) {
 		{".env", ".env"},
 		{"a-_.b", "a-_.b"},
 		{strings.Repeat("a", 116) + ".tar", strings.Repeat("a", 116) + ".tar"},
+		// Characters that aren't allowed are dropped, not refused.
+		{"my file!.txt", "my-file.txt"},
+		{"my file (1).txt", "my-file-1.txt"},
+		{"../../etc/passwd", "....etcpasswd"},
+		{`C:\Users\me\photo.jpg`, "CUsersmephoto.jpg"},
+		{"ünïcode.md", "ncode.md"},
+		{"photo#1?.jpg", "photo1.jpg"},
+		{strings.Repeat("a", 116) + "!!.tar", strings.Repeat("a", 116) + ".tar"},
 	}
 	for _, tt := range ok {
 		got, err := checkFilename(tt.in)
@@ -250,11 +258,9 @@ func TestCheckFilename(t *testing.T) {
 	}
 	bad := []struct{ in, mention string }{
 		{"", "name"},
-		{"../../etc/passwd", "'/'"},
-		{`C:\Users\me\photo.jpg`, `':' '\\'`},
-		{"my file (1).txt", "'(' ')'"},
-		{"ünïcode.md", "'ü' 'ï'"},
 		{"...", "letter or digit"},
+		{"!!!", "letter or digit"},
+		{"(🙂)", "letter or digit"},
 		{"---", "letter or digit"},
 		{strings.Repeat("a", 117) + ".tar", "longer than 120"},
 	}

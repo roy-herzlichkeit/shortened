@@ -37,6 +37,7 @@ type pendingSignup struct {
 	codeHash     string // "" when the address belongs to an account: no code was sent
 	expiresAt    int64
 	tries        int
+	coupon       bool // came with the right coupon: the account starts on corpo
 }
 
 func (s *server) signupCookie(value string, maxAge int) *http.Cookie {
@@ -123,9 +124,9 @@ func (s *server) loadSignup(r *http.Request) (pendingSignup, error) {
 	}
 	p := pendingSignup{tokenHash: hashToken(c.Value)}
 	err = s.db.QueryRowContext(r.Context(), `
-		SELECT username, password_hash, email, code_hash, expires_at, tries FROM signups
+		SELECT username, password_hash, email, code_hash, expires_at, tries, coupon FROM signups
 		WHERE token_hash = ? AND created_at > ?`, p.tokenHash, time.Now().Add(-signupTTL).Unix()).
-		Scan(&p.username, &p.passwordHash, &p.email, &p.codeHash, &p.expiresAt, &p.tries)
+		Scan(&p.username, &p.passwordHash, &p.email, &p.codeHash, &p.expiresAt, &p.tries, &p.coupon)
 	if errors.Is(err, sql.ErrNoRows) {
 		return pendingSignup{}, errNoSignup
 	}
@@ -148,6 +149,12 @@ func (s *server) handleSignup(w http.ResponseWriter, r *http.Request) {
 	email, err := normalizeEmail(c.Email)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// A coupon is optional; a wrong one is refused before any mail goes out.
+	coupon := strings.TrimSpace(c.Coupon) != ""
+	if coupon && !s.couponMatches(c.Coupon) {
+		writeError(w, http.StatusBadRequest, "that coupon code isn't valid; check it, or leave it empty")
 		return
 	}
 	ctx := r.Context()
@@ -201,9 +208,9 @@ func (s *server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO signups (token_hash, username, password_hash, email, code_hash, expires_at, tries, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
-		hashToken(token), c.Username, string(pwHash), email, codeHash, now.Add(codeTTL).Unix(), now.Unix()); err != nil {
+		INSERT INTO signups (token_hash, username, password_hash, email, code_hash, expires_at, tries, created_at, coupon)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+		hashToken(token), c.Username, string(pwHash), email, codeHash, now.Add(codeTTL).Unix(), now.Unix(), coupon); err != nil {
 		fail(err)
 		return
 	}
@@ -286,7 +293,7 @@ func (s *server) handleSignupVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, status, msg := s.createUser(ctx, p.username, p.passwordHash, p.email)
+	id, status, msg := s.createUser(ctx, p.username, p.passwordHash, p.email, p.coupon)
 	if status != 0 {
 		// Someone confirmed the same username or address first, or sign-up
 		// closed meanwhile. This request can't succeed, so it goes.
@@ -383,7 +390,7 @@ func (s *server) canCreate(ctx context.Context, q rowQuerier, username string) (
 // createUser inserts a verified account, or returns an HTTP status and
 // message saying why it can't. The checks and the insert share one
 // transaction, which the single DB connection makes atomic.
-func (s *server) createUser(ctx context.Context, username, pwHash, email string) (int64, int, string) {
+func (s *server) createUser(ctx context.Context, username, pwHash, email string, coupon bool) (int64, int, string) {
 	fail := func(err error) (int64, int, string) {
 		log.Printf("create user %q: %v", username, err)
 		return 0, http.StatusInternalServerError, "could not create the account"
@@ -410,9 +417,13 @@ func (s *server) createUser(ctx context.Context, username, pwHash, email string)
 		// Only reachable by someone who just proved they own the address.
 		return 0, http.StatusConflict, "that address already belongs to another account; sign in to that one or use another address"
 	}
+	plan, couponAt := planFree, int64(0)
+	if coupon {
+		plan, couponAt = planCorpo, time.Now().Unix()
+	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO users (username, password_hash, created_at, email) VALUES (?, ?, ?, ?)`,
-		username, pwHash, time.Now().Unix(), email)
+		`INSERT INTO users (username, password_hash, created_at, email, plan, coupon_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		username, pwHash, time.Now().Unix(), email, plan, couponAt)
 	if err != nil {
 		return fail(err)
 	}
