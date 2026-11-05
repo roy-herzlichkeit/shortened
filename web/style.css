@@ -65,6 +65,41 @@ body.theme-corpo .btn-primary:hover:not(:disabled) { color: var(--yellow); --btn
 body.theme-corpo .danger-title { color: var(--corpo-danger); }
 body.theme-corpo #delete-form { border-top-color: var(--corpo-danger); }
 
+/* CORPO headings: Sentex for the hero and the section titles, steady (no
+   glitch), wider spacing and a soft red glow. Sentex has one weight, so
+   these stay at 400 to avoid a faked bold. */
+@font-face {
+  font-family: "Sentex";
+  src: url("fonts/sentex-regular.ttf") format("truetype");
+  font-display: swap;
+}
+body.theme-corpo .glitch {
+  font-family: "Sentex", var(--font);
+  font-weight: 400;
+  letter-spacing: .08em;
+  line-height: 1.1;
+  color: var(--yellow);
+  text-shadow: 0 0 28px rgba(var(--glow), .35);
+}
+body.theme-corpo .glitch-layer { display: none; }
+body.theme-corpo .frame-title {
+  font-family: "Sentex", var(--font);
+  font-weight: 400;
+  letter-spacing: .16em;
+}
+body.theme-corpo .frame-title .tag { letter-spacing: normal; }
+@media (max-width: 480px) {
+  body.theme-corpo .frame-title { font-size: 17px; letter-spacing: .06em; }
+}
+/* The brand and the CORPO tag in the top bar, in Sentex too. */
+body.theme-corpo .brand-name { font-family: "Sentex", var(--font); font-weight: 400; letter-spacing: .12em; }
+body.theme-corpo .plan-badge { font-family: "Sentex", var(--font); font-size: 13px; letter-spacing: .16em; padding: 3px 9px; }
+
+/* No visible scrollbars, for everyone: the page, dialogs and boxes still
+   scroll by wheel, touch and keyboard. */
+* { scrollbar-width: none; }
+*::-webkit-scrollbar { display: none; }
+
 /* Scanlines over everything; purely decorative. */
 body::after {
   content: "";
@@ -299,9 +334,8 @@ main {
 #email-change-form + #email-code-form + #password-form { border-top: 1px solid var(--line); padding-top: 14px; }
 #delete-form { margin-top: 14px; border-top: 1px solid var(--red); padding-top: 14px; }
 .plan-section { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 6px; }
-.plan-section #get-premium { margin-top: 10px; }
 #coupon-form { margin-top: 14px; }
-#coupon-form[hidden], #get-premium[hidden] { display: none; }
+#coupon-form[hidden] { display: none; }
 .plan-section + #email-change-form { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 14px; }
 .danger-title {
   margin: 0;

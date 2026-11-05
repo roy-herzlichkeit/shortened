@@ -326,7 +326,7 @@ no account, until the link expires or its owner revokes it. `api/shares.go`.
 | Storage | `QUOTA_MB` (500 MB) | 5 GB |
 | Files up to | 50 MB each | any size within the 5 GB (5,000,000,000 bytes per file, the most B2 takes in one PUT) |
 | Share links up to | 7 days | 30 days |
-| Look | yellow theme | `CORPO` badge by the name; a pitch-black background; yellow becomes red, and red and cyan become white, except the danger buttons and the Delete account section, which turn yellow (`body.theme-corpo`) |
+| Look | yellow theme | `CORPO` badge by the name; a pitch-black background; yellow becomes red, and red and cyan become white, except the danger buttons and the Delete account section, which turn yellow; Sentex for the hero, section titles, brand and tag, with no glitch; a red Sentex "S" tab icon (`body.theme-corpo`) |
 
 - The coupon gives CORPO, at sign-up (field "Coupon (optional)") or later in
   Account. The code is `PROMO_CODE` (SSM `/<Env>/PROMO_CODE`), never in the
@@ -338,7 +338,16 @@ no account, until the link expires or its owner revokes it. `api/shares.go`.
   15, plus its size at 256 KB/s (`uploadGrace`), so a multi-GB CORPO upload
   on a slow line isn't dropped while it is still being sent; deleting the
   account waits for it the same way.
-- "Get CORPO (₹1)" only says it is coming soon; buying arrives in Prompt 15.
+- The coupon is the only way to CORPO for now; buying it (₹1) is planned
+  for v3.
+- **Sentex** (`web/fonts/sentex-regular.ttf`, served from our own origin, so
+  the CSP has `font-src 'self'`) is used only under `body.theme-corpo`. The
+  file carries no licence text and its embedding flag says preview/print; the
+  owner chose to use it. It has one weight, so headings in it stay at 400.
+  The tab icon is `favicon.svg` (a drawn S, free) or `favicon-corpo.svg` (the
+  Sentex S as a path, CORPO); the page swaps them with the theme.
+- Scrollbars are hidden for everyone (`scrollbar-width: none` and
+  `::-webkit-scrollbar`); scrolling by wheel, touch and keys still works.
 - The plan is read with the session on every request, so a change applies at
   once: the meter, the upload quota and the share maximum all follow.
 - No admin page: the log has `daily: <n> users, <n> corpo` at start and

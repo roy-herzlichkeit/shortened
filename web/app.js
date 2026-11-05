@@ -75,7 +75,6 @@ const accountStatus = $("account-status");
 const couponInput = $("coupon");
 const planBadge = $("plan-badge");
 const accountPlan = $("account-plan");
-const getPremium = $("get-premium");
 const couponForm = $("coupon-form");
 const couponCode = $("coupon-code");
 const sharesEl = $("shares");
@@ -203,6 +202,7 @@ function showView(view) {
   for (const v of [authView, forgotView, verifyView, appView]) v.hidden = v !== view;
   if (view !== appView) { // signed out: the free look and limits
     document.body.classList.remove("theme-corpo");
+    $("favicon").href = "favicon.svg";
     maxFile = MAX_BYTES;
     $("max-file-hint").textContent = "up to 50 MB each";
     $("footer-size").textContent = "// Max 50 MB per file";
@@ -288,14 +288,15 @@ function showApp(me) {
 }
 
 // renderPlan shows the plan: a CORPO badge by the name and the red theme, and
-// in Account what it gives. Buying (Prompt 15) and the coupon only show while
-// they can still be used.
+// in Account what it gives. The coupon, the only way to CORPO, shows while it
+// can still be used.
 function renderPlan(me) {
   const plan = me.plan || "free";
   const corpo = plan === "corpo";
   planBadge.hidden = !corpo;
   planBadge.textContent = "CORPO";
   document.body.classList.toggle("theme-corpo", corpo);
+  $("favicon").href = corpo ? "favicon-corpo.svg" : "favicon.svg";
   const days = Math.round((me.shareMaxSeconds || 7 * 86400) / 86400);
   const name = corpo ? "CORPO, for life" : "Free";
   maxFile = me.maxFileBytes || MAX_BYTES;
@@ -303,7 +304,6 @@ function renderPlan(me) {
   $("footer-size").textContent = corpo ? "// Any file size within " + formatSize(me.quotaBytes) : "// Max 50 MB per file";
   $("footer-links").textContent = "// Share links self-destruct (10 min to " + days + " days)";
   accountPlan.textContent = name + " · " + formatSize(me.quotaBytes) + " of storage, share links up to " + days + " days";
-  getPremium.hidden = plan !== "free";
   couponForm.hidden = !!me.couponUsed;
 }
 
@@ -1063,7 +1063,6 @@ emailCodeForm.addEventListener("submit", submitEmailCode);
 passwordForm.addEventListener("submit", submitPassword);
 deleteForm.addEventListener("submit", submitDelete);
 couponForm.addEventListener("submit", submitCoupon);
-getPremium.addEventListener("click", () => setStatus("CORPO (₹1, for life) is coming soon."));
 logoutButton.addEventListener("click", logout);
 signupResend.addEventListener("click", resendSignupCode);
 signupRestart.addEventListener("click", () => {
