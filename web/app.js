@@ -857,63 +857,112 @@ async function requestUpload(name, size) {
   }
 }
 
+// checkBatch checks every chosen file before any is sent, so a bad name or
+// size doesn't stop a batch halfway. Returns { items } or { error }.
+function checkBatch(files) {
+  const items = [];
+  const problems = [];
+  const names = new Set();
+  for (const file of files) {
+    const checked = checkFilename(file.name);
+    if (checked.error) problems.push(file.name + ": " + checked.error);
+    else if (file.size > MAX_BYTES) problems.push(file.name + " is larger than 50 MB.");
+    else if (names.has(checked.name)) problems.push(checked.name + " is chosen twice.");
+    else {
+      names.add(checked.name);
+      items.push({ file: file, name: checked.name });
+    }
+  }
+  if (problems.length > 0) return { error: problems.join(" ") + " Nothing was uploaded." };
+
+  // The page's own estimate: files that would replace one of the same name
+  // free its space, so only the server can judge those, and it checks each
+  // file again anyway.
+  const adding = items.filter((it) => !currentFiles.some((f) => f.name === it.name))
+    .reduce((sum, it) => sum + it.file.size, 0);
+  if (quota.total > 0 && quota.used + adding > quota.total) {
+    return {
+      error: "Not enough storage left for " + (items.length > 1 ? "these files" : "this file") + ": " +
+        formatSize(adding) + " more, with " + formatSize(quota.used) + " of " + formatSize(quota.total) + " used."
+    };
+  }
+  return { items: items };
+}
+
+// uploadOne reserves, PUTs and confirms one file. Resolves to the stored name,
+// or null when the user cancelled at the same-name question.
+async function uploadOne(item, label) {
+  setStatus("Requesting an upload link" + label + "…");
+  const signed = await requestUpload(item.name, item.file.size);
+  if (!signed) return null;
+
+  setStatus("Uploading " + signed.name + label + "…");
+  progressBar.style.width = "0%";
+  progress.hidden = false;
+  activeKey = signed.key;
+  try {
+    await putWithProgress(signed.url, item.file);
+  } catch (err) {
+    // The PUT failed or was cancelled: give the reservation back now. The
+    // server keeps the file if the bytes did land after all.
+    await releaseUpload(signed.key);
+    throw err;
+  } finally {
+    activeKey = null;
+  }
+
+  setStatus("Checking " + signed.name + label + "…");
+  const usage = await api("/files/confirm?key=" + encodeURIComponent(signed.key), { method: "POST" });
+  renderUsage(usage);
+  return signed.name;
+}
+
+// upload sends the chosen files one after another. Each has its own
+// reservation, so the server checks the quota for every file: a batch can't
+// pass the plan's cap, whatever the cap is. Cancel stops the batch; files
+// already uploaded stay.
 async function upload() {
-  const file = fileInput.files[0];
-  if (!file) {
+  const files = [...fileInput.files];
+  if (files.length === 0) {
     setStatus("Choose a file first.", "error");
     return;
   }
-  const checked = checkFilename(file.name);
-  if (checked.error) {
-    setStatus(checked.error, "error");
-    return;
-  }
-  if (file.size > MAX_BYTES) {
-    setStatus("Files must be 50 MB or smaller.", "error");
-    return;
-  }
-  // A replace frees the old file's space, so only the server can judge that.
-  const sameName = currentFiles.some((f) => f.name === checked.name);
-  if (!sameName && quota.total > 0 && quota.used + file.size > quota.total) {
-    setStatus("Not enough storage left for this file: " + formatSize(quota.used) + " of " +
-      formatSize(quota.total) + " used.", "error");
+  const batch = checkBatch(files);
+  if (batch.error) {
+    setStatus(batch.error, "error");
     return;
   }
 
   uploadButton.disabled = true;
-  let signed = null;
+  const done = [];
+  const skipped = [];
+  let current = null;
   try {
-    setStatus("Requesting an upload link…");
-    signed = await requestUpload(checked.name, file.size);
-    if (!signed) {
-      setStatus("Upload cancelled.");
-      return;
+    for (let i = 0; i < batch.items.length; i++) {
+      current = batch.items[i];
+      const label = batch.items.length > 1 ? " (" + (i + 1) + " of " + batch.items.length + ")" : "";
+      const stored = await uploadOne(current, label);
+      if (stored === null) skipped.push(current.name);
+      else done.push(stored !== current.name ? stored + " (kept both)" : stored);
     }
-
-    setStatus("Uploading " + signed.name + "…");
-    progressBar.style.width = "0%";
-    progress.hidden = false;
-    activeKey = signed.key;
-    try {
-      await putWithProgress(signed.url, file);
-    } catch (err) {
-      // The PUT failed or was cancelled: give the reservation back now. The
-      // server keeps the file if the bytes did land after all.
-      await releaseUpload(signed.key);
-      throw err;
-    }
-
-    setStatus("Checking the upload…");
-    const usage = await api("/files/confirm?key=" + encodeURIComponent(signed.key), { method: "POST" });
-    renderUsage(usage);
+    current = null;
 
     fileInput.value = "";
     fileName.textContent = "No file selected";
-    setStatus("Upload complete: " + signed.name + (signed.name !== checked.name ? " (kept both)" : "") + ".");
+    if (done.length === 0) setStatus("Upload cancelled.");
+    else {
+      setStatus("Upload complete: " + (done.length > 1 ? done.length + " files, " : "") + done.join(", ") + "." +
+        (skipped.length ? " Skipped: " + skipped.join(", ") + "." : ""));
+    }
     await refresh();
   } catch (err) {
-    if (err instanceof UploadCancelled) setStatus(err.message);
-    else handleError(err);
+    const before = done.length ? " " + done.length + " uploaded before it: " + done.join(", ") + "." : "";
+    if (err instanceof UploadCancelled) setStatus("Upload cancelled." + before);
+    else if (err instanceof ApiError && (err.status === 401 || (err.status === 403 && err.body && err.body.needsEmail))) handleError(err);
+    else {
+      const why = /[.!?]$/.test(err.message) ? err.message : err.message + ".";
+      setStatus((current && batch.items.length > 1 ? current.name + ": " : "") + why + before, "error");
+    }
     refreshQuietly();
   } finally {
     activeKey = null;
@@ -978,8 +1027,12 @@ cancelButton.addEventListener("click", () => {
 });
 refreshButton.addEventListener("click", () => refresh().catch(handleError));
 fileInput.addEventListener("change", () => {
-  const file = fileInput.files[0];
-  fileName.textContent = file ? file.name + " · " + formatSize(file.size) : "No file selected";
+  const files = [...fileInput.files];
+  const total = files.reduce((sum, f) => sum + f.size, 0);
+  if (files.length === 0) fileName.textContent = "No file selected";
+  else if (files.length === 1) fileName.textContent = files[0].name + " · " + formatSize(files[0].size);
+  else fileName.textContent = files.length + " files · " + formatSize(total);
+  fileName.title = files.map((f) => f.name).join(", ");
 });
 
 // Closing or leaving the tab mid-upload: hand the reservation back so it

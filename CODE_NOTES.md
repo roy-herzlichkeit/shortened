@@ -75,6 +75,14 @@ server: HEAD the object; confirm the row with its real size, or drop it;
         a confirmed Replace deletes the old file -> {"usedBytes","quotaBytes"}
 ```
 
+Several files at once: the page checks every chosen file first (name, 50 MB,
+the same name chosen twice, and its own estimate of the room left) and sends
+nothing if one fails. It then runs the flow above for each file in turn, so
+each file has its own reservation and the server checks the quota for every
+one: a batch can't pass the cap, whatever the plan's cap is. The batch stops
+at the first file the server refuses (the files before it stay); Cancel stops
+it too; Cancel at the same-name question skips only that file.
+
 ## Why these choices
 
 **Open sign-up, with limits.** Anyone can register, so each user has a quota
@@ -559,3 +567,18 @@ Not run:
 - Not covered locally: the browser's own PUT to the bucket. The dev bucket's
   CORS rule doesn't list `localhost:8091`, so the walk-through uploaded with a
   plain PUT to the same signed URL. Staging and live upload from the browser.
+
+**Several files at once**, on 2026-11-05:
+
+- Page code only; the server is unchanged. `node --check`, html-validate and
+  `go test ./...` are clean.
+- Headless Chrome, local server with a 1 MB quota, a fresh account above id
+  2 (deleted at the end): three files in one go ("3 files · 5.9 KB", then
+  "Upload complete: 3 files, a.txt, b.txt, c.txt."); a bad name in the batch
+  sends nothing; a stored name plus a new one, Cancel at the question, uploads
+  only the new one ("Skipped: a.txt"); a batch over the cap is refused by the
+  page; with the page's estimate forced wrong, the server takes the first file
+  and refuses the second with 413 ("f.txt: not enough storage left … 1
+  uploaded before it: e.txt."). The dev bucket's CORS doesn't list the local
+  origin, so the walk answered the preflight itself and replayed each PUT from
+  Node to the same signed URL.
