@@ -472,6 +472,12 @@ func (s *server) deleteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Links die first: a file that is half deleted must not stay shared.
+	if err := s.revokeSharesOf(r.Context(), key); err != nil {
+		log.Printf("revoke links to %q: %v", key, err)
+		writeError(w, http.StatusInternalServerError, "could not delete the file")
+		return
+	}
 	if err := s.deleteAllVersions(r.Context(), key); err != nil {
 		log.Printf("delete %q: %v", key, err)
 		writeError(w, http.StatusBadGateway, "could not delete the file")
@@ -592,10 +598,14 @@ func (s *server) markConfirmed(ctx context.Context, userID int64, key string, si
 }
 
 // finishReplace deletes the file a "Replace" upload swapped out, every
-// version, and its ledger row, then clears the new row's replaces column.
+// version, and its ledger row, then clears the new row's replaces column. Its
+// share links move to the new file: Replace is a new version, not a deletion.
 func (s *server) finishReplace(ctx context.Context, userID int64, newKey, oldKey string) error {
 	if !validKey(oldKey) || !strings.HasPrefix(oldKey, userPrefix(userID)) {
 		return fmt.Errorf("refusing to replace %q: not one of this user's keys", oldKey)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE shares SET key = ? WHERE key = ? AND user_id = ?`, newKey, oldKey, userID); err != nil {
+		return err
 	}
 	if err := s.deleteAllVersions(ctx, oldKey); err != nil {
 		return err

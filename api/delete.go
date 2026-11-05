@@ -19,16 +19,14 @@ import (
 //     is still out (its bytes could land after the folder was emptied).
 //  2. Delete every object version and hide marker under u/<id>/ in B2, then
 //     list again to be sure the folder is empty.
-//  3. In one transaction, delete the account's rows: sessions, codes, mail
-//     log, ledger, then the user row.
+//  3. In one transaction, delete the account's rows: share links, sessions,
+//     codes, mail log, ledger, then the user row.
 //  4. Clear the cookie and mail a confirmation to the verified address.
 //
 // If step 2 fails halfway, nothing in the database has changed: the account
 // still signs in, and asking again deletes whatever is left. Step 3 is all or
 // nothing. The username can then be taken again; the id never is
 // (AUTOINCREMENT), so a new account never sees the old folder.
-//
-// Share links (Prompt 13) must be added to step 3 when they exist.
 
 const deleteWord = "DELETE"
 
@@ -144,6 +142,7 @@ func (s *server) deleteAccountRows(ctx context.Context, userID int64) error {
 	}
 	defer tx.Rollback()
 	for _, q := range []string{
+		`DELETE FROM shares WHERE user_id = ?`,
 		`DELETE FROM sessions WHERE user_id = ?`,
 		`DELETE FROM otps WHERE user_id = ?`,
 		`DELETE FROM mail_log WHERE user_id = ?`,

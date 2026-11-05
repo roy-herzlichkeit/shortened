@@ -47,6 +47,11 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | `GET /files` | cookie | The user's own files, newest first: `[{"key","name","size","lastModified"}]`. Reconciles the ledger with the bucket. |
 | `DELETE /files?key=` | cookie | Deletes one of the user's own files → `204`. |
 | `GET /download-url?key=` | cookie | HEADs the object first. Present → `{"url"}`, a presigned GET that downloads as an attachment. Missing → `404 "this file is no longer in storage"`, and its ledger row goes. Storage unreachable → `502`. |
+| `GET /shares` | cookie | `{"minSeconds","maxSeconds","links":[{"code","path","key","name","createdAt","expiresAt"}]}`: the caller's live links (not revoked, not expired, file still stored), soonest expiry first. Times are Unix seconds. |
+| `POST /shares` | cookie | `{"key","seconds"}` → `201` with the new link. `seconds` from 600 to the plan's maximum (7 days on free), else `400`. Someone else's key, or one not yet confirmed → `404`. 100 live links already → `409`. |
+| `DELETE /shares?code=` | cookie | Revokes the caller's link → `204`. Someone else's code, or none → `404`. |
+| `GET /s/<code>` | none, limited per IP | The recipient's page (HTML): name, size, expiry and a Download button. Unknown code → `404`; expired, revoked or file deleted → `410`, each with its own text. `no-store`, `noindex`, no referrer, no script. |
+| `GET /s/<code>/download` | none, limited per IP | Checks the link and the object, then `302` to a fresh 10-minute B2 link (attachment). The object gone from the bucket → `410`, and the link dies. Over the limit (30 at once, then one every 2 s per IP) → `429`. |
 
 Errors are always `{"error": "..."}`. A missing or expired session gets `401`.
 Someone else's key gets `404`, the same as a missing file.
@@ -260,16 +265,45 @@ a warning that premium is lost with no refund. `api/delete.go`, in this order:
    still out, since its bytes could land after the folder was emptied.
 2. Delete every object version and hide marker under `u/<id>/`, one
    `DeleteObject` per version, then list again; anything left is an error.
-3. One transaction deletes the sessions, codes, mail log, ledger rows and the
-   user row.
+3. One transaction deletes the share links, sessions, codes, mail log, ledger
+   rows and the user row.
 4. Clear the cookie and mail a confirmation to the verified address (in the
    background; a failed mail doesn't undo anything).
 
 If B2 fails in step 2, the database is untouched: the account still signs in
 and asking again deletes what is left. Step 3 is all or nothing. The username
 and address are free again afterwards; the id never comes back
-(`AUTOINCREMENT`), so a new account can't see an old folder. Share links
-(Prompt 13) must join step 3.
+(`AUTOINCREMENT`), so a new account can't see an old folder.
+
+## Share links
+
+`https://<host>/s/<code>`: anyone with the link can download the file, with
+no account, until the link expires or its owner revokes it. `api/shares.go`.
+
+- The code is 24 random base62 characters from `crypto/rand` (rejection
+  sampling, so every character is uniform): about 143 bits, so links can't be
+  guessed or listed. The rate limit on `/s/` is per viewer IP, separate from
+  the sign-in limiter.
+- The owner picks the lifetime from presets (10 minutes, 1 hour, 1 day, 7
+  days) or a custom value, from 10 minutes up to the plan's maximum
+  (`maxShareTTL`: 7 days for everyone until plans arrive in Prompt 14).
+- The page shows only the name, the size and the expiry. Download goes to
+  `/s/<code>/download`, which signs a new 10-minute attachment link at each
+  click, so a B2 URL copied out of the browser dies quickly while the share
+  link keeps working. It is a plain link (no form), so the strict CSP needs no
+  `form-action` for the B2 host; the page has no script at all.
+- A link works while it isn't revoked, hasn't expired, and its file is still a
+  stored file of its owner in the ledger. So a file deleted in the app, gone
+  from the bucket, or removed with its account takes its links with it,
+  whichever way it went. Deleting a file also revokes its links first.
+  **Replace** moves the links to the new file: it is a new version, not a
+  deletion.
+- `shares.key` deliberately has no foreign key: a dead link keeps its row so
+  the page can say why (expired, revoked, deleted). Rows dead for 30 days are
+  purged when the owner makes a new link. 100 live links per account at most.
+- Never cached (`no-store`, and CloudFront has caching off), never indexed
+  (`X-Robots-Tag` and the robots meta tag), and `Referrer-Policy: no-referrer`
+  keeps the code out of other sites' logs.
 
 ## Known limits
 
@@ -500,3 +534,28 @@ Not run:
   close the dialog, show the sign-in form, `me` is `401`, the row is gone and
   the confirmation mail is logged; the same name signs up again with the next
   id and "0 B of 500 MB". At 800 and 320 px nothing scrolls sideways.
+
+**Share links**, on 2026-11-05:
+
+- `go test ./...`, `go vet`, gofmt, staticcheck, gosec, html-validate and
+  `node --check` are clean. New tests: a link's page (name, size, `no-store`,
+  `noindex`, no script) and its download (`302` to a 10-minute attachment
+  link); lifetimes below 10 minutes or above 7 days refused, an unconfirmed
+  upload can't be shared; an expired link and a revoked one give `410` on the
+  page and the download, and the other links keep working; someone else's code
+  can't be revoked and their file can't be shared (`404`); unknown or malformed
+  codes give `404`; a file deleted in the app, or gone from the bucket, kills
+  its links (`410`); Replace keeps them, pointing at the new file; the 6th
+  request from one IP gets `429` and another IP doesn't; deleting the account
+  removes its links (`404`).
+- Local server (port 8091, dev bucket, a fresh account above id 2, deleted at
+  the end): Share on a file, a custom 8 days refused in the page, 90 minutes
+  made; the link and its expiry show, Active links lists it; a stranger (no
+  cookie) gets the page with `noindex` and `no-store`, the download redirects
+  to B2, and B2 serves the same bytes as an attachment; revoking from the list
+  gives `410` "turned this link off"; a second link dies with its file (`410`
+  "has been deleted"). At 800 and 320 px nothing scrolls sideways; no script
+  errors.
+- Not covered locally: the browser's own PUT to the bucket. The dev bucket's
+  CORS rule doesn't list `localhost:8091`, so the walk-through uploaded with a
+  plain PUT to the same signed URL. Staging and live upload from the browser.

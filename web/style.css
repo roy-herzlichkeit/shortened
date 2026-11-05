@@ -454,6 +454,31 @@ main {
 .file-meta { flex: 0 0 auto; font-family: var(--mono); font-size: 13px; color: var(--muted); }
 .file-actions { display: flex; gap: 8px; }
 
+/* ---------- Share links ---------- */
+
+.form select {
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  color: var(--text);
+  font: inherit;
+  font-family: var(--mono);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 0;
+}
+.form select:focus { outline: none; border-color: var(--yellow); box-shadow: 0 0 0 1px var(--yellow); }
+.custom-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+.custom-row[hidden] { display: none; }
+.share-result { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+.share-result[hidden] { display: none; }
+#share-url { font-family: var(--mono); font-size: 13px; }
+.share-frame { max-width: 560px; }
+.share-name { margin: 0 0 4px; font-size: 18px; overflow-wrap: anywhere; }
+.share-frame .btn { margin-top: 16px; }
+a.btn { text-decoration: none; }
+.brand-link { color: inherit; text-decoration: none; }
+
 /* ---------- Same-name dialog ---------- */
 
 .dialog {

@@ -71,6 +71,21 @@ const signupRestart = $("signup-restart");
 const accountDialog = $("account-dialog");
 const accountClose = $("account-close");
 const accountStatus = $("account-status");
+const sharesEl = $("shares");
+const shareDialog = $("share-dialog");
+const shareClose = $("share-close");
+const shareFile = $("share-file");
+const shareForm = $("share-form");
+const shareTTL = $("share-ttl");
+const shareCustom = $("share-custom");
+const shareCustomValue = $("share-custom-value");
+const shareCustomUnit = $("share-custom-unit");
+const shareLimit = $("share-limit");
+const shareResult = $("share-result");
+const shareURL = $("share-url");
+const shareExpires = $("share-expires");
+const shareCopy = $("share-copy");
+const shareStatus = $("share-status");
 
 let mode = "login";
 // What the code in the verify view confirms: "signup" (a sign-up waiting for
@@ -80,11 +95,14 @@ let quota = { used: 0, total: 0 };
 let currentFiles = [];
 let activeUpload = null; // the XHR of the upload in progress, for Cancel
 let activeKey = null; // its reserved key, released if the tab closes mid-upload
+let shareTarget = null; // the file the Share dialog is for
+// Link lifetimes the account may pick, in seconds (from GET /shares).
+let shareLimits = { min: 600, max: 7 * 24 * 3600 };
 
-// While the Account dialog is open, messages go to its own line, since the
-// page's status line is behind the backdrop.
+// While a dialog is open, messages go to its own line, since the page's
+// status line is behind the backdrop.
 function setStatus(text, kind) {
-  const el = accountDialog.open ? accountStatus : statusEl;
+  const el = shareDialog.open ? shareStatus : accountDialog.open ? accountStatus : statusEl;
   el.textContent = text;
   el.className = "status" + (kind ? " " + kind : "");
 }
@@ -271,6 +289,7 @@ async function openAccount() {
 
 function closeAccount() {
   if (accountDialog.open) accountDialog.close();
+  closeShare();
 }
 
 function renderAccount(me) {
@@ -342,15 +361,80 @@ function renderFiles(files) {
     download.textContent = "Download";
     download.addEventListener("click", () => downloadFile(file, download));
 
+    const share = document.createElement("button");
+    share.type = "button";
+    share.className = "btn btn-ghost btn-small";
+    share.textContent = "Share";
+    share.addEventListener("click", () => openShare(file));
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "btn btn-danger btn-small";
     remove.textContent = "Delete";
     remove.addEventListener("click", () => deleteFile(file, remove));
 
-    actions.append(download, remove);
+    actions.append(share, download, remove);
     item.append(name, meta, actions);
     filesEl.append(item);
+  }
+}
+
+function shareLinkOf(link) {
+  return window.location.origin + link.path;
+}
+
+// "in 40 min", "in 5 h", "in 6 days": how long a link has left.
+function timeLeft(expiresAt) {
+  const s = Math.max(0, expiresAt - Date.now() / 1000);
+  if (s < 3600) return "in " + Math.max(1, Math.round(s / 60)) + " min";
+  if (s < 2 * 86400) return "in " + Math.round(s / 3600) + " h";
+  return "in " + Math.round(s / 86400) + " days";
+}
+
+function expiryText(expiresAt) {
+  return "Expires " + new Date(expiresAt * 1000).toLocaleString() + " (" + timeLeft(expiresAt) + ")";
+}
+
+function renderShares(res) {
+  shareLimits = { min: res.minSeconds, max: res.maxSeconds };
+  sharesEl.replaceChildren();
+  if (!res.links || res.links.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "empty";
+    empty.textContent = "No active links.";
+    sharesEl.append(empty);
+    return;
+  }
+  for (const link of res.links) {
+    const item = document.createElement("li");
+
+    const name = document.createElement("span");
+    name.className = "file-name";
+    name.textContent = link.name;
+    name.title = link.name;
+
+    const meta = document.createElement("span");
+    meta.className = "file-meta";
+    meta.textContent = expiryText(link.expiresAt);
+
+    const actions = document.createElement("span");
+    actions.className = "file-actions";
+
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "btn btn-ghost btn-small";
+    copy.textContent = "Copy link";
+    copy.addEventListener("click", () => copyLink(shareLinkOf(link)));
+
+    const revoke = document.createElement("button");
+    revoke.type = "button";
+    revoke.className = "btn btn-danger btn-small";
+    revoke.textContent = "Revoke";
+    revoke.addEventListener("click", () => revokeLink(link, revoke));
+
+    actions.append(copy, revoke);
+    item.append(name, meta, actions);
+    sharesEl.append(item);
   }
 }
 
@@ -375,6 +459,11 @@ async function refresh() {
   }
   renderFiles(files);
   await refreshUsage();
+  await refreshShares();
+}
+
+async function refreshShares() {
+  renderShares(await api("/shares"));
 }
 
 async function refreshUsage() {
@@ -625,8 +714,85 @@ async function downloadFile(file, button) {
   }
 }
 
+/* ---------- Share links ---------- */
+
+function openShare(file) {
+  shareTarget = file;
+  shareFile.textContent = file.name || file.key;
+  shareResult.hidden = true;
+  shareURL.value = "";
+  shareStatus.textContent = "";
+  shareStatus.className = "status";
+  shareLimit.textContent = "Anyone with the link can download the file until it expires or you revoke it. " +
+    "From 10 minutes up to " + Math.round(shareLimits.max / 86400) + " days.";
+  shareDialog.showModal();
+  shareTTL.focus();
+}
+
+function closeShare() {
+  if (shareDialog.open) shareDialog.close();
+}
+
+// shareSeconds reads the chosen lifetime, or returns an error message.
+function shareSeconds() {
+  if (shareTTL.value !== "custom") return { seconds: Number(shareTTL.value) };
+  const amount = Number(shareCustomValue.value);
+  if (!Number.isInteger(amount) || amount < 1) return { error: "Enter a whole number for how long the link lasts." };
+  const seconds = amount * Number(shareCustomUnit.value);
+  if (seconds < shareLimits.min) return { error: "A link lasts at least 10 minutes." };
+  if (seconds > shareLimits.max) {
+    return { error: "A link lasts at most " + Math.round(shareLimits.max / 86400) + " days." };
+  }
+  return { seconds: seconds };
+}
+
+function submitShare(event) {
+  event.preventDefault();
+  const chosen = shareSeconds();
+  if (chosen.error) {
+    setStatus(chosen.error, "error");
+    return;
+  }
+  withButton(shareForm, async () => {
+    const link = await postJSON("/shares", { key: shareTarget.key, seconds: chosen.seconds });
+    shareURL.value = shareLinkOf(link);
+    shareExpires.textContent = expiryText(link.expiresAt) + ".";
+    shareResult.hidden = false;
+    shareURL.select();
+    setStatus("Link created. Copy it and send it to whoever needs the file.");
+    refreshShares().catch(() => {});
+  });
+}
+
+async function copyLink(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    setStatus("Link copied.");
+  } catch (_) {
+    // No clipboard access (an old browser, or not HTTPS): select it to copy by hand.
+    if (shareDialog.open && shareURL.value === text) {
+      shareURL.select();
+      setStatus("Press Ctrl+C (or long-press) to copy the selected link.");
+    } else {
+      setStatus("Couldn't copy automatically. The link is " + text, "error");
+    }
+  }
+}
+
+async function revokeLink(link, button) {
+  button.disabled = true;
+  try {
+    await api("/shares?code=" + encodeURIComponent(link.code), { method: "DELETE" });
+    setStatus("Link to " + link.name + " revoked. It stops working at once.");
+    await refreshShares();
+  } catch (err) {
+    handleError(err);
+    button.disabled = false;
+  }
+}
+
 async function deleteFile(file, button) {
-  if (!confirm("Delete " + (file.name || file.key) + "? This cannot be undone.")) return;
+  if (!confirm("Delete " + (file.name || file.key) + "? This cannot be undone, and its share links stop working.")) return;
   button.disabled = true;
   try {
     await api("/files?key=" + encodeURIComponent(file.key), { method: "DELETE" });
@@ -791,6 +957,16 @@ signupRestart.addEventListener("click", () => {
   setStatus("");
 });
 whoami.addEventListener("click", openAccount);
+shareForm.addEventListener("submit", submitShare);
+shareTTL.addEventListener("change", () => {
+  shareCustom.hidden = shareTTL.value !== "custom";
+  if (!shareCustom.hidden) shareCustomValue.focus();
+});
+shareCopy.addEventListener("click", () => copyLink(shareURL.value));
+shareClose.addEventListener("click", closeShare);
+shareDialog.addEventListener("click", (event) => {
+  if (event.target === shareDialog) closeShare();
+});
 accountClose.addEventListener("click", closeAccount);
 // A click on the backdrop (outside the panel) closes it too.
 accountDialog.addEventListener("click", (event) => {
