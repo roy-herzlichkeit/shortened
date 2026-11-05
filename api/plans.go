@@ -17,7 +17,7 @@ import (
 //   - corpo: 5 GB, files of any size within it (up to the 5,000,000,000
 //     bytes B2 takes in one upload), links up to 30 days, a CORPO badge and
 //     a red theme.
-//     The coupon gives it; buying it (₹1) comes in Prompt 15.
+//     The coupon is the only way to it (buying was dropped).
 //
 // The plan is read with the session on every request, so a change applies at
 // once. The coupon code comes from PROMO_CODE (SSM /<Env>/PROMO_CODE) and is

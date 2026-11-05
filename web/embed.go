@@ -4,5 +4,5 @@ package web
 
 import "embed"
 
-//go:embed index.html app.js style.css
+//go:embed index.html app.js style.css favicon.svg favicon-corpo.svg fonts
 var FS embed.FS

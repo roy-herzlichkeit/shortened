@@ -253,7 +253,7 @@ func (s *server) pageHandler() http.Handler {
 		// The upload PUT goes straight to the bucket's endpoint.
 		"connect-src 'self' " + originOf(s.cfg.endpoint),
 		"style-src 'self' https://fonts.googleapis.com",
-		"font-src https://fonts.gstatic.com",
+		"font-src 'self' https://fonts.gstatic.com",
 		"img-src 'self' data:",
 		"object-src 'none'",
 		"base-uri 'none'",
