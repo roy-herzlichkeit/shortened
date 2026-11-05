@@ -34,7 +34,7 @@ the bytes, and a SQLite file holds accounts, sessions and storage usage.
 | `GET /auth/signup/pending` | `signup` cookie | `200 {"username","pendingEmail"}` or `404`; lets the page pick a sign-up back up after a reload. |
 | `POST /auth/login` | none, rate-limited | `{"username","password"}`, where `username` may also be the verified email → `200`, sets the session cookie. |
 | `POST /auth/logout` | cookie | Ends this session → `204`. |
-| `GET /auth/me` | cookie | `{"username","email","pendingEmail","verified","usedBytes","storedBytes","reservedBytes","quotaBytes","plan","couponUsed","shareMaxSeconds"}`. `plan` is `free` or `corpo`; `quotaBytes` and `shareMaxSeconds` follow it. First checks the ledger against the bucket (at most every 30 s per user), so `storedBytes` is what B2 holds; `reservedBytes` is held by upload links not yet confirmed; `usedBytes` is their sum, which the quota counts. |
+| `GET /auth/me` | cookie | `{"username","email","pendingEmail","verified","usedBytes","storedBytes","reservedBytes","quotaBytes","plan","couponUsed","shareMaxSeconds","maxFileBytes"}`. `plan` is `free` or `corpo`; `quotaBytes` and `shareMaxSeconds` follow it. First checks the ledger against the bucket (at most every 30 s per user), so `storedBytes` is what B2 holds; `reservedBytes` is held by upload links not yet confirmed; `usedBytes` is their sum, which the quota counts. |
 | `POST /auth/email` | cookie, rate-limited | `{"email","password"}` → `202 {"pendingEmail"}`: mails a code to the address (first address, a new code, or a change; a change needs the password, else `403`). Over 3 mails an hour → `429`. |
 | `POST /auth/email/verify` | cookie, rate-limited | `{"code"}` → `200 {"email"}`: the pending address becomes the account's. Wrong or expired → `400`. |
 | `POST /auth/forgot` | none, rate-limited | `{"login"}` (username or email) → always `202` with the same message; a code goes to the verified address if there is one. |
@@ -64,7 +64,7 @@ browser --POST /auth/login {username,password}--> server: bcrypt check, new sess
 server  --Set-Cookie: session=<random>; HttpOnly; Secure; SameSite=Lax--> browser
 
 browser --POST /upload-url {filename,size,onConflict} + cookie--> server
-server: session -> user; size <= 50 MB; check the name;
+server: session -> user; size <= the plan's file limit; clean the name;
         list u/<id>/ in B2 and reconcile the ledger;
         name in use? -> 409 (ask), or Keep both / Replace;
         used (- the replaced file) + size <= quota?
@@ -174,7 +174,7 @@ Replace loses nothing.
 
 **The upload size is signed.** The declared size goes into the presigned PUT
 as `Content-Length`, so B2 refuses a body of any other size. That makes both
-the 50 MB limit and the quota binding. The browser sets `Content-Length`
+the per-file limit and the quota binding. The browser sets `Content-Length`
 itself from the file.
 
 **Downloads are attachments.** Presigned GETs carry
@@ -324,8 +324,9 @@ no account, until the link expires or its owner revokes it. `api/shares.go`.
 | | free | CORPO |
 |---|---|---|
 | Storage | `QUOTA_MB` (500 MB) | 5 GB |
+| Files up to | 50 MB each | any size within the 5 GB (5,000,000,000 bytes per file, the most B2 takes in one PUT) |
 | Share links up to | 7 days | 30 days |
-| Look | yellow theme | `CORPO` badge by the name; yellow and red swap (`body.theme-corpo`) |
+| Look | yellow theme | `CORPO` badge by the name; a pitch-black background; yellow becomes red, and red and cyan become white, except the danger buttons and the Delete account section, which turn yellow (`body.theme-corpo`) |
 
 - The coupon gives CORPO, at sign-up (field "Coupon (optional)") or later in
   Account. The code is `PROMO_CODE` (SSM `/<Env>/PROMO_CODE`), never in the
@@ -333,6 +334,10 @@ no account, until the link expires or its owner revokes it. `api/shares.go`.
   hashed, then compared in constant time. Once per account (`coupon_at`), and
   the `UPDATE … WHERE coupon_at = 0` makes a parallel second try a no-op. It
   goes through the sign-in rate limiter.
+- An unconfirmed upload keeps its reservation for the link's 10 minutes plus
+  15, plus its size at 256 KB/s (`uploadGrace`), so a multi-GB CORPO upload
+  on a slow line isn't dropped while it is still being sent; deleting the
+  account waits for it the same way.
 - "Get CORPO (₹1)" only says it is coming soon; buying arrives in Prompt 15.
 - The plan is read with the session on every request, so a change applies at
   once: the meter, the upload quota and the share maximum all follow.

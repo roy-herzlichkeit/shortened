@@ -6,6 +6,7 @@
   --yellow-2: #d8cb00; /* the meter's stripe */
   --glow: 252, 238, 10; /* --yellow as r, g, b for rgba() */
   --cyan: #00f0ff;
+  --cyan-rgb: 0, 240, 255; /* --cyan as r, g, b for rgba() */
   --red: #ff003c;
   --bg: #0a0a0d;
   --panel: #111118;
@@ -31,22 +32,38 @@ body {
   font: 500 17px/1.45 var(--font);
   color: var(--text);
   background:
-    linear-gradient(rgba(0, 240, 255, .035) 1px, transparent 1px) 0 0 / 100% 32px,
-    linear-gradient(90deg, rgba(0, 240, 255, .035) 1px, transparent 1px) 0 0 / 32px 100%,
+    linear-gradient(rgba(var(--cyan-rgb), .035) 1px, transparent 1px) 0 0 / 100% 32px,
+    linear-gradient(90deg, rgba(var(--cyan-rgb), .035) 1px, transparent 1px) 0 0 / 32px 100%,
     radial-gradient(ellipse at 80% -10%, rgba(var(--glow), .10), transparent 55%),
     var(--bg);
 }
 
-/* CORPO accounts: the yellow and the red swap places, so the buttons, top
-   bar and highlights turn red and warnings turn yellow. Set on <body> while a
-   CORPO account is signed in. */
+/* CORPO accounts: the buttons, top bar and highlights turn red; what was
+   red or cyan turns white, except the danger buttons (delete, revoke,
+   replace, cancel) and the Delete account section, which are yellow. Set on
+   <body> while a CORPO account is signed in. */
 body.theme-corpo {
   --yellow: #ff3b47;
   --yellow-2: #c81e2c;
   --glow: 255, 59, 71;
-  --red: #fcee0a;
+  --red: #ffffff;
+  --cyan: #ffffff;
+  --cyan-rgb: 255, 255, 255;
+  --corpo-danger: #fcee0a;
+  --bg: #000000;
+  /* Pitch black: the grid stays, the coloured glow at the top goes. */
+  background:
+    linear-gradient(rgba(var(--cyan-rgb), .035) 1px, transparent 1px) 0 0 / 100% 32px,
+    linear-gradient(90deg, rgba(var(--cyan-rgb), .035) 1px, transparent 1px) 0 0 / 32px 100%,
+    #000000;
 }
-body.theme-corpo .btn-danger:hover:not(:disabled) { color: #000; }
+html:has(body.theme-corpo) { background: #000000; }
+body.theme-corpo .btn-danger { color: var(--corpo-danger); --btn-line: var(--corpo-danger); --btn-glow: var(--corpo-danger); }
+body.theme-corpo .btn-danger:hover:not(:disabled) { color: #000; --btn-fill: var(--corpo-danger); }
+/* Main buttons hover like Sign out: black fill, red label and outline. */
+body.theme-corpo .btn-primary:hover:not(:disabled) { color: var(--yellow); --btn-fill: #000; --btn-line: var(--yellow); --btn-glow: rgba(var(--glow), .5); }
+body.theme-corpo .danger-title { color: var(--corpo-danger); }
+body.theme-corpo #delete-form { border-top-color: var(--corpo-danger); }
 
 /* Scanlines over everything; purely decorative. */
 body::after {
@@ -515,7 +532,7 @@ a.btn { text-decoration: none; }
   color: var(--text);
   background: linear-gradient(180deg, var(--panel-2), var(--panel));
   border: 1px solid var(--cyan);
-  box-shadow: 0 0 24px rgba(0, 240, 255, .25);
+  box-shadow: 0 0 24px rgba(var(--cyan-rgb), .25);
 }
 .dialog .frame-inner { clip-path: none; }
 .dialog::backdrop { background: rgba(0, 0, 0, .7); }

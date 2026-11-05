@@ -160,6 +160,7 @@ type meResponse struct {
 	Plan          string `json:"plan"`          // free or corpo
 	CouponUsed    bool   `json:"couponUsed"`    // the coupon can't be used again
 	ShareMaxSecs  int64  `json:"shareMaxSeconds"`
+	MaxFileBytes  int64  `json:"maxFileBytes"` // the largest single upload
 }
 
 func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +186,7 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 		Username: u.username, Email: u.email, PendingEmail: u.pendingEmail, Verified: u.email != "",
 		UsedBytes: stored + reserved, StoredBytes: stored, ReservedBytes: reserved, QuotaBytes: s.quotaFor(u),
 		Plan: u.plan, CouponUsed: u.couponAt > 0, ShareMaxSecs: int64(s.maxShareTTL(u) / time.Second),
+		MaxFileBytes: s.maxFileFor(u),
 	})
 }
 
