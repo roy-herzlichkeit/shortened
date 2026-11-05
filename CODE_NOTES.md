@@ -325,7 +325,7 @@ no account, until the link expires or its owner revokes it. `api/shares.go`.
 |---|---|---|
 | Storage | `QUOTA_MB` (500 MB) | 5 GB |
 | Share links up to | 7 days | 30 days |
-| Look | yellow theme | `CORPO` badge by the name; yellow and red swap (`body.theme-corpo`) |
+| Look | yellow theme | `CORPO` badge by the name; yellow becomes red, and red and cyan become white, except the danger buttons and the Delete account section, which turn yellow (`body.theme-corpo`) |
 
 - The coupon gives CORPO, at sign-up (field "Coupon (optional)") or later in
   Account. The code is `PROMO_CODE` (SSM `/<Env>/PROMO_CODE`), never in the
