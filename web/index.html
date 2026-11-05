@@ -30,7 +30,7 @@
       <span class="glitch-layer" aria-hidden="true">Upload. Store. Share.</span>
       <span class="glitch-layer" aria-hidden="true">Upload. Store. Share.</span>
     </h1>
-    <p class="hero-sub">Files go straight from your browser to cloud storage. Only you can see yours, and every link self-destructs after 10 minutes.</p>
+    <p class="hero-sub">Files go straight from your browser to cloud storage. Only you can see yours until you share one: anyone with the link can download it, and the link self-destructs when its time is up.</p>
   </section>
 
   <section id="auth-view" class="frame" aria-labelledby="auth-title" hidden>
@@ -154,6 +154,13 @@
         <ul id="files" class="files"><li class="empty">Loading…</li></ul>
       </div>
     </div>
+
+    <div class="frame">
+      <div class="frame-inner">
+        <h2 class="frame-title"><span class="tag">04</span> Active links</h2>
+        <ul id="shares" class="files"><li class="empty">No active links.</li></ul>
+      </div>
+    </div>
   </section>
 
   <p id="status" class="status" role="status" aria-live="polite"></p>
@@ -162,7 +169,7 @@
 <dialog id="account-dialog" class="dialog dialog-wide" aria-labelledby="account-title">
   <div class="frame-inner">
     <div class="list-head">
-      <h2 id="account-title" class="frame-title"><span class="tag">04</span> Account</h2>
+      <h2 id="account-title" class="frame-title"><span class="tag">05</span> Account</h2>
       <button id="account-close" class="btn btn-ghost btn-small" type="button">Close</button>
     </div>
     <p class="hint">Email: <span id="account-email" class="mono"></span></p>
@@ -210,6 +217,46 @@
   </div>
 </dialog>
 
+<dialog id="share-dialog" class="dialog dialog-wide" aria-labelledby="share-title">
+  <div class="frame-inner">
+    <div class="list-head">
+      <h2 id="share-title" class="frame-title"><span class="tag">&gt;&gt;</span> Share</h2>
+      <button id="share-close" class="btn btn-ghost btn-small" type="button">Close</button>
+    </div>
+    <p id="share-file" class="dialog-text"></p>
+
+    <form id="share-form" class="form" novalidate>
+      <label for="share-ttl">Link lasts</label>
+      <select id="share-ttl" name="ttl">
+        <option value="600">10 minutes</option>
+        <option value="3600">1 hour</option>
+        <option value="86400" selected>1 day</option>
+        <option value="604800">7 days</option>
+        <option value="custom">Custom…</option>
+      </select>
+      <div id="share-custom" class="custom-row" hidden>
+        <input id="share-custom-value" name="amount" type="number" inputmode="numeric" min="1" step="1" value="2"
+               aria-label="How long">
+        <select id="share-custom-unit" name="unit" aria-label="Unit">
+          <option value="60">minutes</option>
+          <option value="3600" selected>hours</option>
+          <option value="86400">days</option>
+        </select>
+      </div>
+      <p id="share-limit" class="hint">Anyone with the link can download the file until it expires or you revoke it.</p>
+      <button class="btn btn-primary" type="submit">Create link</button>
+    </form>
+
+    <div id="share-result" class="form share-result" hidden>
+      <label for="share-url">Link</label>
+      <input id="share-url" type="text" readonly spellcheck="false">
+      <p id="share-expires" class="hint"></p>
+      <button id="share-copy" class="btn btn-ghost" type="button">Copy link</button>
+    </div>
+    <p id="share-status" class="status" role="status" aria-live="polite"></p>
+  </div>
+</dialog>
+
 <dialog id="conflict" class="dialog" aria-labelledby="conflict-title">
   <form method="dialog" class="frame-inner">
     <h2 id="conflict-title" class="frame-title"><span class="tag">!!</span> Name in use</h2>
@@ -224,7 +271,7 @@
 
 <footer class="footer mono">
   <span>// Max 50 MB per file</span>
-  <span>// Signed links expire in 10 min</span>
+  <span>// Share links self-destruct (10 min to 7 days)</span>
 </footer>
 
 <script src="app.js"></script>

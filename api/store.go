@@ -29,6 +29,10 @@ import (
 // signups holds sign-ups waiting for their code (see signup.go): no users row
 // exists until the code is entered. signup_mail counts sign-up mails per
 // address for the same hourly limit.
+//
+// shares holds share links (see shares.go). key has no foreign key on purpose:
+// a link whose file row is gone is dead, and its row stays so the page can say
+// so. revoked_at is 0 while the owner hasn't turned the link off.
 const schema = `
 CREATE TABLE IF NOT EXISTS users (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +86,16 @@ CREATE TABLE IF NOT EXISTS signup_mail (
 	sent_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS signup_mail_email ON signup_mail(email, sent_at);
+CREATE TABLE IF NOT EXISTS shares (
+	code       TEXT    PRIMARY KEY,
+	key        TEXT    NOT NULL,
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL,
+	revoked_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS shares_user ON shares(user_id, expires_at);
+CREATE INDEX IF NOT EXISTS shares_key ON shares(key);
 `
 
 func openDB(path string) (*sql.DB, error) {
@@ -97,6 +111,11 @@ func openDB(path string) (*sql.DB, error) {
 	// one connection that deadlocks.
 	db.SetMaxOpenConns(1)
 
+	var hadShares int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'shares'`).Scan(&hadShares); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("read schema: %w", err)
+	}
 	if _, err := db.Exec(schema); err != nil {
 		_ = db.Close() // the schema error is the one worth reporting
 		return nil, fmt.Errorf("create schema: %w", err)
@@ -112,6 +131,9 @@ func openDB(path string) (*sql.DB, error) {
 	if err := migrateUsersEmail(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate users email: %w", err)
+	}
+	if hadShares == 0 {
+		log.Printf("migration: shares table created")
 	}
 	return db, nil
 }

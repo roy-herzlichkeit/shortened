@@ -134,8 +134,10 @@ type server struct {
 	client  *s3.Client
 	presign *s3.PresignClient
 	limiter *ipLimiter
-	mailer  mailer
-	mailWG  sync.WaitGroup // mails still being sent, waited for at shutdown
+	// shareLimiter is the per-viewer-IP limit on the public /s/ pages.
+	shareLimiter *ipLimiter
+	mailer       mailer
+	mailWG       sync.WaitGroup // mails still being sent, waited for at shutdown
 
 	// syncedAt holds, per user id, when the ledger was last checked against
 	// the bucket (a time.Time), so /auth/me doesn't list the bucket on every call.
@@ -183,8 +185,10 @@ func newServer(ctx context.Context, cfg config, db *sql.DB) (*server, error) {
 		presign: s3.NewPresignClient(client),
 		// 10 attempts at once, then one every 6 seconds, per client IP.
 		limiter: newIPLimiter(6*time.Second, 10),
-		mailer:  m,
-		meSync:  true,
+		// 30 at once, then one every 2 seconds, per viewer IP.
+		shareLimiter: newIPLimiter(2*time.Second, 30),
+		mailer:       m,
+		meSync:       true,
 	}, nil
 }
 
@@ -215,6 +219,11 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/files/confirm", noStore(s.requireVerified(s.handleConfirm)))
 	mux.Handle("/files/release", noStore(s.requireVerified(s.handleRelease)))
 	mux.Handle("/download-url", noStore(s.requireVerified(s.handleDownloadURL)))
+	mux.Handle("/shares", noStore(s.requireVerified(s.handleShares)))
+
+	// Share links: public, no account needed, limited per viewer IP.
+	mux.Handle("GET /s/{code}", s.shareLimited(s.handleSharePage))
+	mux.Handle("GET /s/{code}/download", s.shareLimited(s.handleShareDownload))
 
 	mux.Handle("/", s.pageHandler())
 	return mux

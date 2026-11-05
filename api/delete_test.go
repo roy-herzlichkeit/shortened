@@ -18,6 +18,7 @@ func rowsFor(t *testing.T, s *server, id int64) map[string]int {
 	out := map[string]int{}
 	for _, q := range []struct{ table, query string }{
 		{"users", `SELECT COUNT(*) FROM users WHERE id = ?`},
+		{"shares", `SELECT COUNT(*) FROM shares WHERE user_id = ?`},
 		{"sessions", `SELECT COUNT(*) FROM sessions WHERE user_id = ?`},
 		{"files", `SELECT COUNT(*) FROM files WHERE user_id = ?`},
 		{"otps", `SELECT COUNT(*) FROM otps WHERE user_id = ?`},
@@ -52,6 +53,7 @@ func TestDeleteAccount(t *testing.T) {
 	b2.put(prefix+"0000000000000000-hidden.txt", 5, time.Now())
 	b2.hide(prefix + "0000000000000000-hidden.txt")
 	do(t, h, http.MethodPost, "/auth/forgot", `{"login":"alice"}`) // leaves an otp and a mail_log row
+	link := mustShare(t, h, c, k1, 3600)
 	bob := signup(t, h, "bob")
 	bobKey := stores(t, h, b2, bob, "bobs.txt", 10)
 
@@ -74,6 +76,9 @@ func TestDeleteAccount(t *testing.T) {
 	}
 	if !b2.has(bobKey) {
 		t.Error("another user's file was deleted")
+	}
+	if res := visit(t, h, link.Path); res.StatusCode != http.StatusNotFound {
+		t.Errorf("share link after the account was deleted: status %d, want 404", res.StatusCode)
 	}
 	if left := rowsFor(t, s, id); len(left) != 0 {
 		t.Errorf("rows left for the deleted account: %v", left)
