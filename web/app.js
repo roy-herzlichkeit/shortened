@@ -71,6 +71,12 @@ const signupRestart = $("signup-restart");
 const accountDialog = $("account-dialog");
 const accountClose = $("account-close");
 const accountStatus = $("account-status");
+const couponInput = $("coupon");
+const planBadge = $("plan-badge");
+const accountPlan = $("account-plan");
+const getPremium = $("get-premium");
+const couponForm = $("coupon-form");
+const couponCode = $("coupon-code");
 const sharesEl = $("shares");
 const shareDialog = $("share-dialog");
 const shareClose = $("share-close");
@@ -174,22 +180,18 @@ function formatSize(bytes) {
   return value.toFixed(1).replace(/\.0$/, "") + " " + units[unit];
 }
 
-// The same rules as the server: spaces become "-", then only A-Z a-z 0-9 . _ -
-// are allowed. Returns { name } or { error }.
+// The same rules as the server: spaces become "-" and every character other
+// than A-Z a-z 0-9 . _ - is dropped; the caller tells the user about a rename.
+// Returns { name } or { error }.
 function checkFilename(raw) {
-  const name = raw.replace(/ /g, "-");
-  if (!name) return { error: "The file needs a name." };
-  const bad = [...new Set(name.replace(/[A-Za-z0-9._-]/g, ""))];
-  if (bad.length > 0) {
-    return {
-      error: "File names may use only letters, digits, dot, underscore and dash. Rename the file to remove " +
-        bad.map((c) => "\u201c" + c + "\u201d").join(" ") + "."
-    };
-  }
-  if (new TextEncoder().encode(name).length > MAX_NAME) {
+  if (!raw) return { error: "The file needs a name." };
+  const name = raw.replace(/ /g, "-").replace(/[^A-Za-z0-9._-]/g, "");
+  if (name.length > MAX_NAME) {
     return { error: "File name is longer than " + MAX_NAME + " characters. Rename the file first." };
   }
-  if (!/[A-Za-z0-9]/.test(name)) return { error: "File name needs at least one letter or digit." };
+  if (!/[A-Za-z0-9]/.test(name)) {
+    return { error: "File name needs at least one letter or digit once characters that aren't allowed are dropped." };
+  }
   return { name: name };
 }
 
@@ -198,6 +200,7 @@ function checkFilename(raw) {
 // Only one of the four views is shown at a time.
 function showView(view) {
   for (const v of [authView, forgotView, verifyView, appView]) v.hidden = v !== view;
+  if (view !== appView) document.body.classList.remove("theme-corpo"); // signed out: the free look
 }
 
 function showAuth() {
@@ -246,6 +249,7 @@ function showVerify(me) {
   showView(verifyView);
   account.hidden = false;
   whoami.disabled = true; // no settings until the address is confirmed
+  planBadge.hidden = true;
   whoami.textContent = me.username;
   verifyCode.value = "";
   addressForm.hidden = false;
@@ -276,6 +280,22 @@ function showApp(me) {
   renderAccount(me);
 }
 
+// renderPlan shows the plan: a CORPO badge by the name and the red theme, and
+// in Account what it gives. Buying (Prompt 15) and the coupon only show while
+// they can still be used.
+function renderPlan(me) {
+  const plan = me.plan || "free";
+  const corpo = plan === "corpo";
+  planBadge.hidden = !corpo;
+  planBadge.textContent = "CORPO";
+  document.body.classList.toggle("theme-corpo", corpo);
+  const days = Math.round((me.shareMaxSeconds || 7 * 86400) / 86400);
+  const name = corpo ? "CORPO, for life" : "Free";
+  accountPlan.textContent = name + " · " + formatSize(me.quotaBytes) + " of storage, share links up to " + days + " days";
+  getPremium.hidden = plan !== "free";
+  couponForm.hidden = !!me.couponUsed;
+}
+
 async function openAccount() {
   accountStatus.textContent = "";
   accountStatus.className = "status";
@@ -293,6 +313,7 @@ function closeAccount() {
 }
 
 function renderAccount(me) {
+  renderPlan(me);
   accountEmail.textContent = me.email;
   emailCodeForm.hidden = !me.pendingEmail;
   emailCodeTarget.textContent = me.pendingEmail || "";
@@ -306,7 +327,7 @@ function setMode(next) {
   authSubmit.textContent = signup ? "Create account" : "Sign in";
   passwordInput.autocomplete = signup ? "new-password" : "current-password";
   usernameLabel.textContent = signup ? "Username" : "Username or email";
-  emailRow.hidden = !signup;
+  emailRow.hidden = !signup; // the coupon field is in this row too
   forgotOpen.hidden = signup;
   authHint.textContent = signup
     ? "3-32 characters for the username (letters, digits, _ or -). Password 8-72 characters. We mail a code to the address."
@@ -521,8 +542,9 @@ async function submitAuth(event) {
   try {
     if (mode === "signup") {
       // No account yet: it is created when the mailed code is entered.
-      const pending = await postJSON("/auth/signup", { username, password, email });
+      const pending = await postJSON("/auth/signup", { username, password, email, coupon: couponInput.value.trim() });
       passwordInput.value = "";
+      couponInput.value = "";
       showSignupVerify(pending);
       setStatus("Code sent to " + pending.pendingEmail + ".");
       return;
@@ -655,6 +677,24 @@ function submitPassword(event) {
     currentPassword.value = "";
     newPassword.value = "";
     setStatus("Password changed. Every other session is signed out.");
+  });
+}
+
+function submitCoupon(event) {
+  event.preventDefault();
+  if (!couponCode.value.trim()) {
+    setStatus("Enter the coupon code.", "error");
+    return;
+  }
+  withButton(couponForm, async () => {
+    await postJSON("/auth/coupon", { code: couponCode.value.trim() });
+    couponCode.value = "";
+    const me = await api("/auth/me");
+    renderAccount(me);
+    renderUsage(me);
+    refreshShares().catch(() => {});
+    setStatus("Coupon applied: you're on CORPO for life, with " + formatSize(me.quotaBytes) +
+      " and share links up to " + Math.round(me.shareMaxSeconds / 86400) + " days.");
   });
 }
 
@@ -858,10 +898,12 @@ async function requestUpload(name, size) {
 }
 
 // checkBatch checks every chosen file before any is sent, so a bad name or
-// size doesn't stop a batch halfway. Returns { items } or { error }.
+// size doesn't stop a batch halfway. Returns { items, renamed } or { error };
+// renamed lists the names that were cleaned, as "old to new".
 function checkBatch(files) {
   const items = [];
   const problems = [];
+  const renamed = [];
   const names = new Set();
   for (const file of files) {
     const checked = checkFilename(file.name);
@@ -871,6 +913,7 @@ function checkBatch(files) {
     else {
       names.add(checked.name);
       items.push({ file: file, name: checked.name });
+      if (checked.name !== file.name) renamed.push("\u201c" + file.name + "\u201d to \u201c" + checked.name + "\u201d");
     }
   }
   if (problems.length > 0) return { error: problems.join(" ") + " Nothing was uploaded." };
@@ -886,7 +929,7 @@ function checkBatch(files) {
         formatSize(adding) + " more, with " + formatSize(quota.used) + " of " + formatSize(quota.total) + " used."
     };
   }
-  return { items: items };
+  return { items: items, renamed: renamed };
 }
 
 // uploadOne reserves, PUTs and confirms one file. Resolves to the stored name,
@@ -933,6 +976,12 @@ async function upload() {
     return;
   }
 
+  // Said once more at the end, as the status line changes during the upload.
+  const renamedNote = batch.renamed.length
+    ? " Renamed " + batch.renamed.join(", ") + " (dropped characters that aren't allowed)."
+    : "";
+  if (renamedNote) setStatus(renamedNote.trim());
+
   uploadButton.disabled = true;
   const done = [];
   const skipped = [];
@@ -952,16 +1001,16 @@ async function upload() {
     if (done.length === 0) setStatus("Upload cancelled.");
     else {
       setStatus("Upload complete: " + (done.length > 1 ? done.length + " files, " : "") + done.join(", ") + "." +
-        (skipped.length ? " Skipped: " + skipped.join(", ") + "." : ""));
+        (skipped.length ? " Skipped: " + skipped.join(", ") + "." : "") + renamedNote);
     }
     await refresh();
   } catch (err) {
     const before = done.length ? " " + done.length + " uploaded before it: " + done.join(", ") + "." : "";
-    if (err instanceof UploadCancelled) setStatus("Upload cancelled." + before);
+    if (err instanceof UploadCancelled) setStatus("Upload cancelled." + before + renamedNote);
     else if (err instanceof ApiError && (err.status === 401 || (err.status === 403 && err.body && err.body.needsEmail))) handleError(err);
     else {
       const why = /[.!?]$/.test(err.message) ? err.message : err.message + ".";
-      setStatus((current && batch.items.length > 1 ? current.name + ": " : "") + why + before, "error");
+      setStatus((current && batch.items.length > 1 ? current.name + ": " : "") + why + before + renamedNote, "error");
     }
     refreshQuietly();
   } finally {
@@ -999,6 +1048,8 @@ emailChangeForm.addEventListener("submit", submitEmailChange);
 emailCodeForm.addEventListener("submit", submitEmailCode);
 passwordForm.addEventListener("submit", submitPassword);
 deleteForm.addEventListener("submit", submitDelete);
+couponForm.addEventListener("submit", submitCoupon);
+getPremium.addEventListener("click", () => setStatus("CORPO (₹1, for life) is coming soon."));
 logoutButton.addEventListener("click", logout);
 signupResend.addEventListener("click", resendSignupCode);
 signupRestart.addEventListener("click", () => {

@@ -100,7 +100,7 @@ func (s *server) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "could not check your storage usage")
 		return
 	}
-	res, err := s.reserve(r.Context(), u.id, name, req.Size, req.OnConflict)
+	res, err := s.reserve(r.Context(), u.id, s.quotaFor(u), name, req.Size, req.OnConflict)
 	if err != nil {
 		log.Printf("reserve %q for user %d: %v", name, u.id, err)
 		writeError(w, http.StatusInternalServerError, "could not check your storage usage")
@@ -109,7 +109,7 @@ func (s *server) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 	switch res.outcome {
 	case reserveNoRoom:
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-			"not enough storage left: %s of %s used", formatMB(res.used), formatMB(s.cfg.quotaBytes)))
+			"not enough storage left: %s of %s used", formatMB(res.used), formatMB(s.quotaFor(u))))
 		return
 	case reserveConflict:
 		writeJSON(w, http.StatusConflict, conflictResponse{
@@ -172,7 +172,7 @@ type reservation struct {
 //     goes once the new upload is confirmed.
 //   - A name in use by an upload that hasn't been confirmed: "keepboth" picks
 //     a free name, anything else reports reserveBusy.
-func (s *server) reserve(ctx context.Context, userID int64, name string, size int64, onConflict string) (reservation, error) {
+func (s *server) reserve(ctx context.Context, userID, quota int64, name string, size int64, onConflict string) (reservation, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return reservation{}, err
@@ -233,7 +233,7 @@ func (s *server) reserve(ctx context.Context, userID int64, name string, size in
 		}
 	}
 
-	if used-credit+size > s.cfg.quotaBytes {
+	if used-credit+size > quota {
 		return reservation{outcome: reserveNoRoom, used: used}, nil
 	}
 
@@ -502,15 +502,15 @@ type usageResponse struct {
 	QuotaBytes    int64 `json:"quotaBytes"`
 }
 
-func (s *server) writeUsage(w http.ResponseWriter, r *http.Request, userID int64) {
-	stored, reserved, err := s.storageUsage(r.Context(), userID)
+func (s *server) writeUsage(w http.ResponseWriter, r *http.Request, u user) {
+	stored, reserved, err := s.storageUsage(r.Context(), u.id)
 	if err != nil {
-		log.Printf("usage for user %d: %v", userID, err)
+		log.Printf("usage for user %d: %v", u.id, err)
 		writeError(w, http.StatusInternalServerError, "could not read your storage usage")
 		return
 	}
 	writeJSON(w, http.StatusOK, usageResponse{
-		UsedBytes: stored + reserved, StoredBytes: stored, ReservedBytes: reserved, QuotaBytes: s.cfg.quotaBytes,
+		UsedBytes: stored + reserved, StoredBytes: stored, ReservedBytes: reserved, QuotaBytes: s.quotaFor(u),
 	})
 }
 
@@ -568,7 +568,7 @@ func (s *server) handleConfirm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not record the upload")
 		return
 	}
-	s.writeUsage(w, r, u.id)
+	s.writeUsage(w, r, u)
 }
 
 // markConfirmed records the object's real size, marks the row stored, and
@@ -641,7 +641,7 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 	if !found || confirmedAt > 0 {
 		// Nothing reserved, or already a stored file: releasing must never
 		// drop a real file from the ledger.
-		s.writeUsage(w, r, u.id)
+		s.writeUsage(w, r, u)
 		return
 	}
 
@@ -662,7 +662,7 @@ func (s *server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not update your storage usage")
 		return
 	}
-	s.writeUsage(w, r, u.id)
+	s.writeUsage(w, r, u)
 }
 
 var errNotInBucket = errors.New("object not in bucket")
@@ -823,40 +823,37 @@ func displayName(key string) string {
 	return base[idLen+1:]
 }
 
-// checkFilename checks a name the browser sent for a new upload. Spaces become
-// "-"; every other character must be one of A-Z a-z 0-9 . _ -, and the name
-// needs at least one letter or digit. Names stored before this rule keep
-// their old form; it applies to new uploads only.
+// checkFilename cleans a name the browser sent for a new upload. Spaces become
+// "-" and every character other than A-Z a-z 0-9 . _ - is dropped (the page
+// does the same first and tells the user); what is left needs at least one
+// letter or digit. Names stored before this rule keep their old form.
 func checkFilename(name string) (string, error) {
-	name = strings.ReplaceAll(name, " ", "-")
 	if name == "" {
 		return "", errors.New("the file needs a name")
 	}
-	if bad := badNameChars(name); bad != "" {
-		return "", fmt.Errorf("file names may use only letters, digits, dot, underscore and dash; rename the file to remove %s", bad)
-	}
+	name = cleanName(name)
 	if len(name) > maxNameLen {
 		return "", fmt.Errorf("file name is longer than %d characters", maxNameLen)
 	}
 	if !strings.ContainsFunc(name, func(r rune) bool { return nameAlnum(r) }) {
-		return "", errors.New("file name needs at least one letter or digit")
+		return "", errors.New("file name needs at least one letter or digit once characters that aren't allowed are dropped")
 	}
 	return name, nil
 }
 
-// badNameChars lists, once each and quoted, the characters checkFilename
-// refuses, or "" if there are none.
-func badNameChars(name string) string {
-	seen := map[rune]bool{}
-	var out []string
+// cleanName turns spaces into "-" and drops every other character outside
+// A-Z a-z 0-9 . _ -.
+func cleanName(name string) string {
+	var b strings.Builder
 	for _, r := range name {
-		if nameAlnum(r) || r == '.' || r == '_' || r == '-' || seen[r] {
-			continue
+		switch {
+		case r == ' ':
+			b.WriteByte('-')
+		case nameAlnum(r) || r == '.' || r == '_' || r == '-':
+			b.WriteRune(r)
 		}
-		seen[r] = true
-		out = append(out, strconv.QuoteRune(r))
 	}
-	return strings.Join(out, " ")
+	return b.String()
 }
 
 func nameAlnum(r rune) bool {

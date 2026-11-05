@@ -164,8 +164,10 @@ jobs:
           expect 413 -b "$jar" -H "$json" -d '{"filename":"a.bin","size":52428801}' "$base/upload-url"
           expect 400 -b "$jar" "$base/download-url?key=..%2Fsecret"
           expect 404 -b "$jar" "$base/download-url?key=u%2F999%2F0123456789abcdef-theirs.txt"
-          expect 400 -b "$jar" -H "$json" -d '{"filename":"photo (1).jpg","size":1}' "$base/upload-url"
-          grep -q "'('" /tmp/body || { echo "bad-name message doesn't name the character"; cat /tmp/body; exit 1; }
+          # Characters that aren't allowed are dropped; only a name with no
+          # letter or digit left is refused.
+          expect 400 -b "$jar" -H "$json" -d '{"filename":"(!)","size":1}' "$base/upload-url"
+          grep -q "letter or digit" /tmp/body || { echo "bad-name message doesn't explain"; cat /tmp/body; exit 1; }
           # The download checks the object in B2 before signing. With these fake
           # credentials B2 can't answer, so the page must get a clear 502, not a
           # link to nothing. (The attachment header is covered by TestDownloadURL.)

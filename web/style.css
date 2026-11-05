@@ -3,6 +3,8 @@
 
 :root {
   --yellow: #fcee0a;
+  --yellow-2: #d8cb00; /* the meter's stripe */
+  --glow: 252, 238, 10; /* --yellow as r, g, b for rgba() */
   --cyan: #00f0ff;
   --red: #ff003c;
   --bg: #0a0a0d;
@@ -31,9 +33,20 @@ body {
   background:
     linear-gradient(rgba(0, 240, 255, .035) 1px, transparent 1px) 0 0 / 100% 32px,
     linear-gradient(90deg, rgba(0, 240, 255, .035) 1px, transparent 1px) 0 0 / 32px 100%,
-    radial-gradient(ellipse at 80% -10%, rgba(252, 238, 10, .10), transparent 55%),
+    radial-gradient(ellipse at 80% -10%, rgba(var(--glow), .10), transparent 55%),
     var(--bg);
 }
+
+/* CORPO accounts: the yellow and the red swap places, so the buttons, top
+   bar and highlights turn red and warnings turn yellow. Set on <body> while a
+   CORPO account is signed in. */
+body.theme-corpo {
+  --yellow: #ff3b47;
+  --yellow-2: #c81e2c;
+  --glow: 255, 59, 71;
+  --red: #fcee0a;
+}
+body.theme-corpo .btn-danger:hover:not(:disabled) { color: #000; }
 
 /* Scanlines over everything; purely decorative. */
 body::after {
@@ -102,6 +115,16 @@ button.account-name {
 button.account-name:hover:not(:disabled), button.account-name:focus-visible { text-decoration: underline; text-underline-offset: 4px; }
 button.account-name:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
 button.account-name:disabled { cursor: default; }
+.plan-badge {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: .14em;
+  color: var(--yellow);
+  background: #000;
+}
+.plan-badge[hidden] { display: none; }
 .topbar .btn-ghost { color: #000; --btn-line: #000; --btn-glow: rgba(0, 0, 0, .5); --btn-focus: var(--red); }
 .topbar .btn-ghost:hover:not(:disabled) { color: var(--yellow); --btn-fill: #000; }
 
@@ -247,7 +270,7 @@ main {
   border-radius: 0;
   outline: none;
 }
-.form input:focus { border-color: var(--yellow); box-shadow: 0 0 0 1px var(--yellow), 0 0 18px rgba(252, 238, 10, .2); }
+.form input:focus { border-color: var(--yellow); box-shadow: 0 0 0 1px var(--yellow), 0 0 18px rgba(var(--glow), .2); }
 .form .btn { margin-top: 10px; }
 
 .hint { margin: 8px 0 0; font-size: 15px; color: var(--muted); }
@@ -258,6 +281,11 @@ main {
 #verify-form + #address-form, #email-code-form + #password-form,
 #email-change-form + #email-code-form + #password-form { border-top: 1px solid var(--line); padding-top: 14px; }
 #delete-form { margin-top: 14px; border-top: 1px solid var(--red); padding-top: 14px; }
+.plan-section { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 6px; }
+.plan-section #get-premium { margin-top: 10px; }
+#coupon-form { margin-top: 14px; }
+#coupon-form[hidden], #get-premium[hidden] { display: none; }
+.plan-section + #email-change-form { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 14px; }
 .danger-title {
   margin: 0;
   font-size: 15px;
@@ -361,7 +389,7 @@ main {
 .bar-fill {
   width: 0;
   height: 100%;
-  background: repeating-linear-gradient(90deg, var(--yellow) 0 10px, #d8cb00 10px 12px);
+  background: repeating-linear-gradient(90deg, var(--yellow) 0 10px, var(--yellow-2) 10px 12px);
   transition: width .25s ease;
 }
 .meter.is-full .bar-fill { background: var(--red); }
@@ -437,7 +465,7 @@ main {
   width: 3px;
   background: transparent;
 }
-.files li:hover { background: rgba(252, 238, 10, .04); }
+.files li:hover { background: rgba(var(--glow), .04); }
 .files li:hover::before { background: var(--yellow); }
 .files li.empty { justify-content: center; color: var(--muted); font-family: var(--mono); }
 .files li.empty::before { display: none; }

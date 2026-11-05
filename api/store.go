@@ -30,6 +30,10 @@ import (
 // exists until the code is entered. signup_mail counts sign-up mails per
 // address for the same hourly limit.
 //
+// users.plan is free or corpo (see plans.go); coupon_at is when the
+// account used the coupon, 0 if never. signups.coupon is 1 when the sign-up
+// came with the right coupon, so the account starts on corpo.
+//
 // shares holds share links (see shares.go). key has no foreign key on purpose:
 // a link whose file row is gone is dead, and its row stays so the page can say
 // so. revoked_at is 0 while the owner hasn't turned the link off.
@@ -40,7 +44,9 @@ CREATE TABLE IF NOT EXISTS users (
 	password_hash TEXT    NOT NULL,
 	created_at    INTEGER NOT NULL,
 	email         TEXT,
-	pending_email TEXT
+	pending_email TEXT,
+	plan          TEXT    NOT NULL DEFAULT 'free',
+	coupon_at     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
 	token_hash TEXT    PRIMARY KEY,
@@ -79,7 +85,8 @@ CREATE TABLE IF NOT EXISTS signups (
 	code_hash     TEXT    NOT NULL,
 	expires_at    INTEGER NOT NULL,
 	tries         INTEGER NOT NULL DEFAULT 0,
-	created_at    INTEGER NOT NULL
+	created_at    INTEGER NOT NULL,
+	coupon        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS signup_mail (
 	email   TEXT    NOT NULL,
@@ -132,6 +139,10 @@ func openDB(path string) (*sql.DB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate users email: %w", err)
 	}
+	if err := migratePlans(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate plans: %w", err)
+	}
 	if hadShares == 0 {
 		log.Printf("migration: shares table created")
 	}
@@ -154,6 +165,43 @@ func columnsOf(db *sql.DB, table string) (map[string]bool, error) {
 		have[name] = true
 	}
 	return have, rows.Err()
+}
+
+// migratePlans adds the plan columns to users and signups from before plans.
+// Every existing account starts on free. Opening an already-migrated database
+// does nothing.
+func migratePlans(db *sql.DB) error {
+	for _, t := range []struct {
+		table string
+		cols  []struct{ name, ddl string }
+	}{
+		{"users", []struct{ name, ddl string }{
+			{"plan", `ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'`},
+			{"coupon_at", `ALTER TABLE users ADD COLUMN coupon_at INTEGER NOT NULL DEFAULT 0`},
+		}},
+		{"signups", []struct{ name, ddl string }{
+			{"coupon", `ALTER TABLE signups ADD COLUMN coupon INTEGER NOT NULL DEFAULT 0`},
+		}},
+	} {
+		have, err := columnsOf(db, t.table)
+		if err != nil {
+			return err
+		}
+		var added []string
+		for _, c := range t.cols {
+			if have[c.name] {
+				continue
+			}
+			if _, err := db.Exec(c.ddl); err != nil {
+				return err
+			}
+			added = append(added, c.name)
+		}
+		if len(added) > 0 {
+			log.Printf("migration: %s table gained %s", t.table, strings.Join(added, ", "))
+		}
+	}
+	return nil
 }
 
 // migrateUsersEmail adds email and pending_email to a users table from before

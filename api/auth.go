@@ -53,6 +53,8 @@ type user struct {
 	username     string
 	email        string // verified address, "" if none yet
 	pendingEmail string // address waiting for its code
+	plan         string // free or corpo
+	couponAt     int64  // when the coupon was used, 0 if never
 }
 
 type userKey struct{}
@@ -64,7 +66,8 @@ func userFrom(r *http.Request) user {
 type loginRequest struct {
 	Username string `json:"username"` // sign-in also takes the verified email here
 	Password string `json:"password"`
-	Email    string `json:"email"` // sign-up only
+	Email    string `json:"email"`  // sign-up only
+	Coupon   string `json:"coupon"` // sign-up only, optional
 }
 
 // readCredentials decodes and validates a sign-up or sign-in body, writing a
@@ -153,7 +156,10 @@ type meResponse struct {
 	UsedBytes     int64  `json:"usedBytes"`     // stored + reserved, what the quota counts
 	StoredBytes   int64  `json:"storedBytes"`   // confirmed in the bucket
 	ReservedBytes int64  `json:"reservedBytes"` // upload links not yet confirmed
-	QuotaBytes    int64  `json:"quotaBytes"`
+	QuotaBytes    int64  `json:"quotaBytes"`    // from the plan
+	Plan          string `json:"plan"`          // free or corpo
+	CouponUsed    bool   `json:"couponUsed"`    // the coupon can't be used again
+	ShareMaxSecs  int64  `json:"shareMaxSeconds"`
 }
 
 func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +183,8 @@ func (s *server) handleMe(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, meResponse{
 		Username: u.username, Email: u.email, PendingEmail: u.pendingEmail, Verified: u.email != "",
-		UsedBytes: stored + reserved, StoredBytes: stored, ReservedBytes: reserved, QuotaBytes: s.cfg.quotaBytes,
+		UsedBytes: stored + reserved, StoredBytes: stored, ReservedBytes: reserved, QuotaBytes: s.quotaFor(u),
+		Plan: u.plan, CouponUsed: u.couponAt > 0, ShareMaxSecs: int64(s.maxShareTTL(u) / time.Second),
 	})
 }
 
@@ -244,9 +251,9 @@ func (s *server) requireUser(next http.HandlerFunc) http.Handler {
 			email, pending sql.NullString
 		)
 		err = s.db.QueryRowContext(r.Context(), `
-			SELECT u.id, u.username, u.email, u.pending_email FROM sessions s JOIN users u ON u.id = s.user_id
+			SELECT u.id, u.username, u.email, u.pending_email, u.plan, u.coupon_at FROM sessions s JOIN users u ON u.id = s.user_id
 			WHERE s.token_hash = ? AND s.expires_at > ?`,
-			hashToken(c.Value), time.Now().Unix()).Scan(&u.id, &u.username, &email, &pending)
+			hashToken(c.Value), time.Now().Unix()).Scan(&u.id, &u.username, &email, &pending, &u.plan, &u.couponAt)
 		u.email, u.pendingEmail = email.String, pending.String
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
